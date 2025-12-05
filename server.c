@@ -1,11 +1,12 @@
 #include "server.h"
+#include "json.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 
-struct Server server_constructor(int domain, int port, int service, int protocol, int backlog, u_long interface, launch LaunchFunc)
+struct Server server_constructor(int domain, int port, int service, int protocol, int backlog, u_long interface)
 {
     struct Server server_obj = {
         .domain = domain,
@@ -14,7 +15,6 @@ struct Server server_constructor(int domain, int port, int service, int protocol
         .protocol = protocol,
         .backlog = backlog,
         .interface = interface,
-        .Launch_function = LaunchFunc,
         .address = {
             .sin_addr.s_addr = INADDR_ANY,
             .sin_port = htons(port),
@@ -38,7 +38,6 @@ struct Server server_constructor(int domain, int port, int service, int protocol
         perror("Failed to listen for connections...");
         exit(EXIT_FAILURE);
     }
-    server_obj.Launch_function = LaunchFunc;
     return server_obj;
 }
 
@@ -87,7 +86,7 @@ struct httpRequest *parse_methods(char *response)
     return request;
 }
 
-void get_func(struct Server *server)
+void get_func(struct Server *server, const char *uri)
 {
     char Buffer[BUFFER_SIZE];
     while (1)
@@ -111,18 +110,42 @@ void get_func(struct Server *server)
         {
             perror("Error reading buffer...\n");
         }
-        char *response = "HTTP/1.1 200 OK\r\n"
-                         "Content-Type: text/html; charset=UTF-8\r\n\r\n"
-                         "<!DOCTYPE html>\r\n"
-                         "<html>\r\n"
-                         "<head>\r\n"
-                         "<title>Testing Basic HTTP-SERVER</title>\r\n"
-                         "</head>\r\n"
-                         "<body>\r\n"
-                         "Hello, Ahmed!\r\n"
-                         "</body>\r\n"
-                         "</html>\r\n";
-        write(new_socket, response, strlen(response));
+        char buffer_2[BUFFER_SIZE];
+
+        const char *json_body = handle_uri(uri);
+
+        int len = snprintf(buffer_2, sizeof(buffer_2), "HTTP/1.1 200 OK\r\n"
+                                                       "Content-Type: application/json\r\n"
+                                                       "Content-Length: %zu\r\n\r\n"
+                                                       "%s",
+                           strlen(json_body), json_body);
+        write(new_socket, buffer_2, strlen(buffer_2));
         close(new_socket);
+        free((void *)json_body);
     }
+}
+int is_just_id(const char *data)
+{
+    const char *ptr = data;
+    while (*ptr != '\0')
+    {
+        if (*ptr < '0' || *ptr > '9')
+            return 0;
+        ptr++;
+    }
+    return 1;
+}
+const char *handle_uri(const char *uri)
+{
+    const char *json = NULL;
+    if (strcmp(uri, "/") == 0)
+        json = handle_get_info();
+    else if (strcmp(uri, "/users") == 0)
+        json = handle_get_users();
+    else if (strncmp(uri, "/users/", 7) == 0)
+    {
+        if (is_just_id(uri + 7))
+            json = handle_user_with_id(atoi(uri + 7));
+    }
+    return json;
 }

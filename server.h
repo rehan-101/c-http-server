@@ -28,7 +28,7 @@ typedef enum Methods
 
 typedef struct Method_pointers
 {
-    void (*GET)(struct Server *);
+    void (*GET)(struct Server *,const char *);
 } method_func_pointers;
 
 struct httpRequest
@@ -39,8 +39,9 @@ struct httpRequest
 };
 
 struct Server
-server_constructor(int domain, int port, int service, int protocol, int backlog, u_long interface, launch LaunchFunc);
-void get_func(struct Server *);
+server_constructor(int domain, int port, int service, int protocol, int backlog, u_long interface);
+void get_func(struct Server *,const char *uri);
 struct httpRequest *parse_methods(char *response);
+const char *handle_uri(const char *uri);
 
 #endif
