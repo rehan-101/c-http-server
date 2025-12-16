@@ -1,0 +1,13 @@
+# Editor
+.vscode/
+
+# Build artifacts
+*.o
+*.out
+server
+
+# Database
+*.db
+
+# OS
+.DS_Store
