@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -g -fsanitize=address
-LDFLAGS = -lcjson -lsqlite3
+LDFLAGS = -lcjson -lsqlite3 -lcrypto -ljwt
 
 SRC_DIR = src
 INC_DIR = include
@@ -20,4 +20,7 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 clean:
 	rm -f $(OBJS) $(BIN)
 
-.PHONY: all clean
+run:
+	export SECRET_KEY=6oGNzV+XNoiumDjNPnyPcuApfOfkoQ3GwF/VDhM2RMg= && ./$(BIN)
+
+.PHONY: all clean run

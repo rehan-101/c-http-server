@@ -14,6 +14,8 @@ typedef enum
     NO_CONTENT,
     BAD_REQUEST,
     INTERNAL_SERVER_ERROR,
+    UNAUTHORIZED,
+    CONFLICT,
 } status;
 
 typedef struct
@@ -26,6 +28,8 @@ JSON_RESPONSE *handle_get_info();
 JSON_RESPONSE *handle_get_users();
 JSON_RESPONSE *handle_user_with_id(int id);
 JSON_RESPONSE *handle_post_data_via_json(char *buff);
+JSON_RESPONSE *handle_post_json_for_register(char *buff);
+JSON_RESPONSE *handle_post_json_for_login(char *buff);
 JSON_RESPONSE *handle_post_data_via_html_form(char *buff);
 JSON_RESPONSE *handle_put_with_id(int id, const char *body);
 JSON_RESPONSE *handle_delete_with_id(int id);

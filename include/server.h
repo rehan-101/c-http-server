@@ -3,6 +3,8 @@
 
 #include <netinet/in.h>
 #include <sqlite3.h>
+#include <openssl/rand.h>
+#include <openssl/evp.h>
 #include "json.h"
 extern sqlite3 *db;
 typedef int socket_t;
@@ -10,6 +12,11 @@ typedef int socket_t;
 struct Server;
 typedef void (*launch)(struct Server *);
 void clean_things(void *, ...);
+
+#define ITERATIONS 10000
+#define SALT_LEN 16
+#define HASH_LEN 32
+
 struct Server
 {
     int domain, port, service, protocol, backlog;
@@ -36,11 +43,13 @@ typedef enum
     URI_USERS,
     URI_USERS_WITH_ID,
     ROOT_URI,
+    URI_FOR_REGISTRATION,
+    URI_FOR_LOGIN,
 } uri_t;
 typedef struct
 {
     Methods method;
-    uri_t enum_for_uri[5];
+    uri_t enum_for_uri[10];
     void (*handler)(socket_t file_descriptor, struct httpRequest *Request);
 } Route;
 struct info_after_method_line
@@ -70,4 +79,7 @@ char *get_content_type(char *buffer);
 int get_content_len(char *buffer);
 char *get_body(char *buffer);
 int is_just_id(const char *uri);
+int make_hashed_password(char *original_pass, char *hashed_pass, const char *salt);
+
+void serve_file(socket_t fd, const char *filepath);
 #endif

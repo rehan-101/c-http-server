@@ -6,11 +6,14 @@
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sendfile.h>
 #include <sqlite3.h>
 
 Route routes[] = {
-    {.method = GET, .enum_for_uri = {ROOT_URI, URI_USERS, URI_USERS_WITH_ID, 0}, .handler = get_func},
-    {.method = POST, .enum_for_uri = {URI_USERS, 0}, .handler = post_func},
+    {.method = GET, .enum_for_uri = {ROOT_URI, URI_USERS, URI_USERS_WITH_ID, URI_FOR_LOGIN, URI_FOR_REGISTRATION, 0}, .handler = get_func},
+    {.method = POST, .enum_for_uri = {URI_USERS, URI_FOR_REGISTRATION, URI_FOR_LOGIN, 0}, .handler = post_func},
     {.method = PUT, .enum_for_uri = {URI_USERS_WITH_ID, 0}, .handler = put_func},
     {.method = DELETE, .enum_for_uri = {URI_USERS_WITH_ID, 0}, .handler = delete_func},
     {.method = PATCH, .enum_for_uri = {URI_USERS_WITH_ID, 0}, .handler = patch_func},
@@ -166,9 +169,11 @@ struct httpRequest *parse_methods(char *response)
         clean_things(method_string, temp_response, request, NULL);
         return NULL;
     }
-    request->enum_for_uri = strcmp(request->uri, "/") == 0 ? ROOT_URI : strcmp(request->uri, "/users") == 0      ? URI_USERS
-                                                                    : (strncmp(request->uri, "/users/", 7) == 0) ? (is_just_id(request->uri + 7)) ? URI_USERS_WITH_ID : URI_UNKNOWN
-                                                                                                                 : URI_UNKNOWN;
+    request->enum_for_uri = (strcmp(request->uri, "/") == 0) ? ROOT_URI : (strcmp(request->uri, "/users") == 0)    ? URI_USERS
+                                                                      : (strncmp(request->uri, "/users/", 7) == 0) ? (is_just_id(request->uri + 7)) ? URI_USERS_WITH_ID : URI_UNKNOWN
+                                                                      : (strcmp(request->uri, "/register") == 0)   ? URI_FOR_REGISTRATION
+                                                                      : strcmp(request->uri, "/login") == 0        ? URI_FOR_LOGIN
+                                                                                                                   : URI_UNKNOWN;
     request->enum_of_method = strcmp(method_string, "GET") == 0 ? GET : (strcmp(method_string, "POST") == 0) ? POST
                                                                     : strcmp(method_string, "PUT") == 0      ? PUT
                                                                     : strcmp(method_string, "DELETE") == 0   ? DELETE
@@ -189,17 +194,24 @@ struct httpRequest *parse_methods(char *response)
 }
 void get_func(socket_t fd, struct httpRequest *Request)
 {
-    JSON_RESPONSE *json_body = (JSON_RESPONSE *)handle_get_uri(Request->uri, Request->enum_for_uri);
-    send_response_back(fd, json_body);
-    if (!json_body)
+    if (strcmp(Request->uri, "/login") == 0)
+        serve_file(fd, "public/login.html");
+        else if(strcmp(Request->uri,"/register")==0)
+        serve_file(fd,"public/register.html");
+    else
     {
-        JSON_RESPONSE *json_body = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
-        json_body->json_string = strdup("{\"message\":\"json is not having anything..endpoint entered might be wrong..\"}");
-        json_body->Status = INTERNAL_SERVER_ERROR;
+        JSON_RESPONSE *json_body = (JSON_RESPONSE *)handle_get_uri(Request->uri, Request->enum_for_uri);
         send_response_back(fd, json_body);
+        if (!json_body)
+        {
+            JSON_RESPONSE *json_body = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
+            json_body->json_string = strdup("{\"message\":\"json is not having anything..endpoint entered might be wrong..\"}");
+            json_body->Status = INTERNAL_SERVER_ERROR;
+            send_response_back(fd, json_body);
+        }
+        close(fd);
+        clean_things(json_body->json_string, json_body, NULL);
     }
-    close(fd);
-    clean_things(json_body->json_string, json_body, NULL);
 }
 void patch_func(socket_t fd, struct httpRequest *Request)
 {
@@ -279,9 +291,19 @@ void post_func(socket_t client_fd, struct httpRequest *post_request)
         {
             json_response = handle_post_data_via_json(post_request->header_info->body);
         }
+        else if (strcmp(post_request->uri, "/register") == 0)
+        {
+            json_response = handle_post_json_for_register(post_request->header_info->body);
+        }
+        else if (strcmp(post_request->uri, "/login") == 0)
+        {
+            json_response = handle_post_json_for_login(post_request->header_info->body);
+        }
         else
+        {
             json_response->json_string = strdup("{\"error\" : \"This endpoint is not defined yet\"}");
-        json_response->Status = BAD_REQUEST;
+            json_response->Status = BAD_REQUEST;
+        }
     }
     else if (strcmp(post_request->header_info->content_type, "application/x-www-form-urlencoded") == 0)
     {
@@ -404,4 +426,46 @@ JSON_RESPONSE *handle_patch_uri(const char *uri, const char *body)
         json->Status = BAD_REQUEST;
     }
     return json;
+}
+
+int make_hashed_password(char *original_pass, char *hashed_pass, const char *salt)
+{
+    if (*salt == 0)
+    {
+        if (!RAND_bytes((unsigned char *)salt, SALT_LEN))
+            return -1;
+    }
+    if (PKCS5_PBKDF2_HMAC((const char *)original_pass,
+                          strlen(original_pass),
+                          (const unsigned char *)salt,
+                          SALT_LEN, ITERATIONS, EVP_sha256(), HASH_LEN,
+                          (unsigned char *)hashed_pass) != 1)
+        return -1;
+    return 0;
+}
+
+void serve_file(socket_t fd, const char *path)
+{
+    int file_fd = open(path, O_RDONLY);
+    if (file_fd < 0)
+        return;
+
+    struct stat st;
+    fstat(file_fd, &st);
+    off_t file_size = st.st_size;
+
+    char header[256];
+    int header_len = sprintf(header, "HTTP/1.1 200 OK\r\n"
+                                     "Content-Length: %ld\r\n"
+                                     "Content-Type: text/html\r\n\r\n",
+                             file_size);
+    write(fd, header, header_len);
+
+    off_t offset = 0;
+    ssize_t send_bytes = sendfile(fd, file_fd, &offset, file_size);
+    if (send_bytes < 0)
+    {
+        perror("sendfile failed");
+    }
+    close(fd);
 }
