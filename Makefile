@@ -21,6 +21,6 @@ clean:
 	rm -f $(OBJS) $(BIN)
 
 run:
-	export SECRET_KEY=6oGNzV+XNoiumDjNPnyPcuApfOfkoQ3GwF/VDhM2RMg= && ./$(BIN)
+	./$(BIN)
 
 .PHONY: all clean run
