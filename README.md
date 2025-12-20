@@ -55,11 +55,23 @@ Make sure the following libraries are installed:
 - libjwt (`libjwt-dev`)
 - OpenSSL (`libssl-dev`)
 
+## Environment Variables
+
+The server requires the following environment variable:
+
+- `SECRET_KEY` – Secret key used to sign and verify JWT tokens
+
+### Generate a Secret Key (One Time)
+
+Use the following command to generate a secure random secret key:
+
+```bash
+openssl rand -base64 32
+```
 ## Build Instructions
 
 ```bash
 make
-
 ```
 ## Run Instructions
 
