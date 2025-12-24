@@ -1,6 +1,7 @@
 #ifndef SERVER_H
 #define SERVER_H
 
+#include <jwt.h>
 #include <netinet/in.h>
 #include <sqlite3.h>
 #include <openssl/rand.h>
@@ -16,6 +17,8 @@ void clean_things(void *, ...);
 #define ITERATIONS 10000
 #define SALT_LEN 16
 #define HASH_LEN 32
+
+extern const char *headers_request; // global pointer for collecting the headers of the request
 
 struct Server
 {
@@ -39,12 +42,14 @@ typedef enum Methods
 struct httpRequest;
 typedef enum
 {
+    URI_USER_INFO = 1,
     URI_UNKNOWN,
     URI_USERS,
     URI_USERS_WITH_ID,
     ROOT_URI,
     URI_FOR_REGISTRATION,
     URI_FOR_LOGIN,
+    URI_FOR_PROFILE,
 } uri_t;
 typedef struct
 {
@@ -72,14 +77,18 @@ void put_func(socket_t client_fd, struct httpRequest *);
 void delete_func(socket_t fd, struct httpRequest *);
 void patch_func(socket_t fd, struct httpRequest *);
 struct httpRequest *parse_methods(char *response);
-JSON_RESPONSE *handle_get_uri(const char *uri, uri_t uri_enum);
+JSON_RESPONSE *handle_get_uri(struct httpRequest *Request, uri_t uri_enum);
 JSON_RESPONSE *handle_patch_uri(const char *uri, const char *body);
 void listening_to_client(socket_t server_fd);
 char *get_content_type(char *buffer);
 int get_content_len(char *buffer);
 char *get_body(char *buffer);
+char *get_header(char *buffer);
 int is_just_id(const char *uri);
 int make_hashed_password(char *original_pass, char *hashed_pass, const char *salt);
 
 void serve_file(socket_t fd, const char *filepath);
+int is_expired(jwt_t *my_jwt, const char *exp);
+char *get_token(const char *body);
+jwt_t *get_decoded_token(char *token);
 #endif

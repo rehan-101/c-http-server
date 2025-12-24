@@ -9,7 +9,6 @@
 #include <unistd.h>
 #include <jwt.h>
 int number_of_users = 0;
-
 void send_response_back(socket_t fd, JSON_RESPONSE *json)
 {
     switch (json->Status)
@@ -60,6 +59,67 @@ void send_json(socket_t fd, int status, const char *status_text, const char *jso
         perror("write");
         return;
     }
+}
+
+JSON_RESPONSE *get_user_info()
+{
+    int id = 0;
+    char *name, *username, *email;
+    name = username = email = NULL;
+    JSON_RESPONSE *json_response = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
+    if (headers_request)
+    {
+        char *token = get_token(headers_request);
+        jwt_t *my_jwt = get_decoded_token(token);
+        if (is_expired(my_jwt, "exp") == 0)
+        {
+            json_response->json_string = strdup("{\"success\":false,\"message\":session timeout Login again\"}");
+            json_response->Status = UNAUTHORIZED;
+        }
+        id = jwt_get_grant_int(my_jwt, "sub");
+        sqlite3_stmt *statement = get_query(db, GET_USER_WITH_ID);
+        if (!statement)
+        {
+            fprintf(stderr, "Nothing assigned to sqlite statement...\n");
+            json_response->json_string = strdup("{\"success\":false,\"message\": \"Error occured in database\"}");
+            json_response->Status = INTERNAL_SERVER_ERROR;
+            return json_response;
+        }
+        else if (sqlite3_bind_int(statement, 1, id) == SQLITE_OK)
+        {
+            if (sqlite3_step(statement) == SQLITE_ROW)
+            {
+                id = (int)sqlite3_column_int(statement, 0);
+                name = (char *)sqlite3_column_text(statement, 1);
+                username = (char *)sqlite3_column_text(statement, 2);
+                email = (char *)sqlite3_column_text(statement, 3);
+            }
+            else
+            {
+                json_response->json_string = strdup("{\"success\":false,\"message\" : \"No record with the specified id found\"}");
+                json_response->Status = NOT_FOUND;
+                return json_response;
+            }
+        }
+        else
+        {
+            json_response->json_string = strdup("{\"success\":false,\"message\": \"Error occured in database\"}");
+            json_response->Status = INTERNAL_SERVER_ERROR;
+            return json_response;
+        }
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddNumberToObject(obj, "id", id);
+        cJSON_AddStringToObject(obj, "name", name);
+        cJSON_AddStringToObject(obj, "username", username);
+        cJSON_AddStringToObject(obj, "email", email);
+
+        json_response->json_string = cJSON_PrintUnformatted(obj);
+        json_response->Status = OK;
+        sqlite3_finalize(statement);
+        cJSON_Delete(obj);
+        jwt_free(my_jwt);
+    }
+    return json_response;
 }
 
 JSON_RESPONSE *handle_get_info()
@@ -595,6 +655,102 @@ JSON_RESPONSE *handle_put_with_id(int id, const char *body)
         json->Status = OK;
     }
     return json;
+}
+
+JSON_RESPONSE *handle_update_current_user(const char *body)
+{
+    int id = 0;
+    JSON_RESPONSE *json_response = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
+    if (headers_request)
+    {
+        char *token = get_token(headers_request);
+        jwt_t *my_jwt = get_decoded_token(token);
+        if (is_expired(my_jwt, "exp") == 0)
+        {
+            json_response->json_string = strdup("{\"success\":false,\"message\":session timeout Login again\"}");
+            json_response->Status = UNAUTHORIZED;
+            return json_response;
+        }
+        id = jwt_get_grant_int(my_jwt, "sub");
+        cJSON *data = cJSON_Parse(body);
+        cJSON *item_name = cJSON_GetObjectItemCaseSensitive(data, "name");
+        cJSON *item_username = cJSON_GetObjectItemCaseSensitive(data, "username");
+        cJSON *item_email = cJSON_GetObjectItemCaseSensitive(data, "email");
+        cJSON *item_password = cJSON_GetObjectItemCaseSensitive(data, "password");
+        if (!cJSON_IsString(item_name) || !cJSON_IsString(item_email) || !cJSON_IsString(item_password))
+        {
+            cJSON_AddNumberToObject(data, "Status", 400);
+            cJSON_AddStringToObject(data, "Error", "Bad Request");
+            cJSON_AddStringToObject(data, "message", "fields are missin or data enetered in inconsistent");
+            json_response->json_string = cJSON_PrintUnformatted(data);
+            json_response->Status = BAD_REQUEST;
+            cJSON_Delete(data);
+            return json_response;
+        }
+        const char *query = NULL;
+        sqlite3_stmt *statement = NULL;
+        int password_given = 0;
+        if (item_password)
+        {
+            query = "UPDATE User SET name=?,username=?,email=?,password=? WHERE id = ?;";
+            password_given = 1;
+        }
+        else
+        {
+            query = "UPDATE User SET name=?,username=?,email=? WHERE id = ?;";
+        }
+        if (sqlite3_prepare_v2(db, query, -1, &statement, NULL) != SQLITE_OK)
+        {
+            fprintf(stderr, "Nothing assigned to sqlite statement...\n");
+            json_response->json_string = strdup("{\"success\":false,\"message\": \"Error occured in database\"}");
+            json_response->Status = INTERNAL_SERVER_ERROR;
+            return json_response;
+        }
+        char *name = item_name->valuestring;
+        char *username = item_username->valuestring;
+        char *email = item_email->valuestring;
+        char *password = item_password->valuestring;
+        int result, specific_error = 0;
+        char salt[SALT_LEN];
+        char new_hashed_password[HASH_LEN];
+        int status = make_hashed_password(password, new_hashed_password, salt);
+        if (status == 0)
+            fprintf(stdout, "Password hashed successflly..Continuing");
+        else
+        {
+            fprintf(stderr, "pass did not bn hashed");
+            cJSON_Delete(data);
+            json_response->json_string = strdup("{\"success\":false,\"error\":internal Server error\"}");
+            json_response->Status = INTERNAL_SERVER_ERROR;
+            return json_response;
+        }
+        char *fields[] = {
+            name, username, email, "password"};
+        for (int i = 1; i < 5; i++)
+        {
+            if (strcmp(fields[i-1], "password") == 0)
+                result = sqlite3_bind_blob(statement, i, new_hashed_password, -1, SQLITE_STATIC);
+            else
+                result = (sqlite3_bind_text(statement, i, fields[i-1], -1, SQLITE_STATIC));
+            if (result != SQLITE_OK)
+            {
+                cJSON_Delete(data);
+                json_response->json_string = strdup("{\"success\":false,\"message\":internal Server error\"}");
+                json_response->Status = INTERNAL_SERVER_ERROR;
+                sqlite3_finalize(statement);
+                return json_response;
+            }
+        }
+        sqlite3_bind_int(statement, 5, id);
+        if (sqlite3_step(statement) == SQLITE_DONE)
+        {
+            json_response->json_string = strdup("{\"success\":true,\"message\":\"Updated successfully\"}");
+            json_response->Status = CREATED;
+        }
+        cJSON_Delete(data);
+        jwt_free(my_jwt);
+        return json_response;
+    }
 }
 
 JSON_RESPONSE *handle_delete_with_id(int id)

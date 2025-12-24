@@ -45,7 +45,7 @@ sqlite3 *start_db()
 }
 const char *const SQL_Queries[] = {
     "SELECT id,name,email FROM STUDENTS;",
-    "SELECT id,name,email FROM STUDENTS WHERE id = ?;",
+    "SELECT id,name,username,email FROM User WHERE id = ?;",
     "SELECT id,password,salt FROM User WHERE username=?;",
     "INSERT INTO STUDENTS(name,email) VALUES (? , ?);",
     "INSERT INTO STUDENTS(name,email) VALUES (? , ?);",

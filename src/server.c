@@ -2,6 +2,7 @@
 #include "../include/json.h"
 #include "../include/database.h"
 #include <stdio.h>
+#include <jwt.h>
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
@@ -12,13 +13,14 @@
 #include <sqlite3.h>
 
 Route routes[] = {
-    {.method = GET, .enum_for_uri = {ROOT_URI, URI_USERS, URI_USERS_WITH_ID, URI_FOR_LOGIN, URI_FOR_REGISTRATION, 0}, .handler = get_func},
+    {.method = GET, .enum_for_uri = {ROOT_URI, URI_USER_INFO, URI_USERS, URI_USERS_WITH_ID, URI_FOR_LOGIN, URI_FOR_REGISTRATION, URI_FOR_PROFILE, 0}, .handler = get_func},
     {.method = POST, .enum_for_uri = {URI_USERS, URI_FOR_REGISTRATION, URI_FOR_LOGIN, 0}, .handler = post_func},
-    {.method = PUT, .enum_for_uri = {URI_USERS_WITH_ID, 0}, .handler = put_func},
+    {.method = PUT, .enum_for_uri = {URI_USERS_WITH_ID, URI_USER_INFO, 0}, .handler = put_func},
     {.method = DELETE, .enum_for_uri = {URI_USERS_WITH_ID, 0}, .handler = delete_func},
     {.method = PATCH, .enum_for_uri = {URI_USERS_WITH_ID, 0}, .handler = patch_func},
 };
 int no_of_routes = sizeof(routes) / sizeof(routes[0]);
+const char *headers_request = NULL; // global pointer for collecting the headers of the request
 
 struct Server server_constructor(int domain, int port, int service, int protocol, int backlog, u_long interface)
 {
@@ -170,7 +172,9 @@ struct httpRequest *parse_methods(char *response)
         return NULL;
     }
     request->enum_for_uri = (strcmp(request->uri, "/") == 0) ? ROOT_URI : (strcmp(request->uri, "/users") == 0)    ? URI_USERS
-                                                                      : (strncmp(request->uri, "/users/", 7) == 0) ? (is_just_id(request->uri + 7)) ? URI_USERS_WITH_ID : URI_UNKNOWN
+                                                                      : (strcmp(request->uri, "/me") == 0)         ? URI_USER_INFO
+                                                                      : strcmp(request->uri, "/profile") == 0      ? URI_FOR_PROFILE
+                                                                      : (strncmp(request->uri, "/users/", 7) == 0) ? ((is_just_id(request->uri + 7)) ? URI_USERS_WITH_ID : URI_UNKNOWN)
                                                                       : (strcmp(request->uri, "/register") == 0)   ? URI_FOR_REGISTRATION
                                                                       : strcmp(request->uri, "/login") == 0        ? URI_FOR_LOGIN
                                                                                                                    : URI_UNKNOWN;
@@ -179,6 +183,7 @@ struct httpRequest *parse_methods(char *response)
                                                                     : strcmp(method_string, "DELETE") == 0   ? DELETE
                                                                                                              : PATCH;
     request->header_info = malloc(sizeof(struct info_after_method_line));
+    headers_request = get_header(response);
     if (request->header_info)
     {
         request->header_info->body = get_body(response);
@@ -196,19 +201,20 @@ void get_func(socket_t fd, struct httpRequest *Request)
 {
     if (strcmp(Request->uri, "/login") == 0)
         serve_file(fd, "public/login.html");
-        else if(strcmp(Request->uri,"/register")==0)
-        serve_file(fd,"public/register.html");
+    else if (strcmp(Request->uri, "/register") == 0)
+        serve_file(fd, "public/register.html");
+    else if (strcmp(Request->uri, "/profile") == 0)
+        serve_file(fd, "public/profile.html");
     else
     {
-        JSON_RESPONSE *json_body = (JSON_RESPONSE *)handle_get_uri(Request->uri, Request->enum_for_uri);
-        send_response_back(fd, json_body);
+        JSON_RESPONSE *json_body = (JSON_RESPONSE *)handle_get_uri(Request, Request->enum_for_uri);
         if (!json_body)
         {
             JSON_RESPONSE *json_body = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
             json_body->json_string = strdup("{\"message\":\"json is not having anything..endpoint entered might be wrong..\"}");
             json_body->Status = INTERNAL_SERVER_ERROR;
-            send_response_back(fd, json_body);
         }
+        send_response_back(fd, json_body);
         close(fd);
         clean_things(json_body->json_string, json_body, NULL);
     }
@@ -282,6 +288,25 @@ char *get_body(char *buff)
     return strdup(body);
 }
 
+char *get_header(char *buff)
+{
+    char *str = strdup(buff);
+    char *end_of_header = strstr(str, "\r\n\r\n");
+    if (end_of_header)
+    {
+        int header_len = end_of_header - str;
+        int total_len = header_len + strlen("\r\n\r\n");
+        char *string_to_be_returned = malloc(total_len + 1);
+        if (string_to_be_returned)
+        {
+            memcpy(string_to_be_returned, str, total_len);
+            string_to_be_returned[total_len] = '\0';
+            return string_to_be_returned;
+        }
+    }
+    return NULL;
+}
+
 void post_func(socket_t client_fd, struct httpRequest *post_request)
 {
     JSON_RESPONSE *json_response = NULL;
@@ -311,6 +336,7 @@ void post_func(socket_t client_fd, struct httpRequest *post_request)
     }
     else
     {
+        json_response = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
         json_response->json_string = strdup("{\"message\":\"SOmething wrong has happened\"}");
         json_response->Status = INTERNAL_SERVER_ERROR;
     }
@@ -322,21 +348,13 @@ void post_func(socket_t client_fd, struct httpRequest *post_request)
 void put_func(socket_t fd, struct httpRequest *Request)
 {
     JSON_RESPONSE *json = NULL;
-    if (strncmp(Request->uri, "/users/", 7) == 0)
+    if (strncmp(Request->uri, "/me", 3) == 0)
     {
-        if (is_just_id(Request->uri + 7))
-        {
-            json = handle_put_with_id(atoi(Request->uri + 7), Request->header_info->body);
-        }
-        else
-        {
-            json = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
-            if (json)
-            {
-                json->json_string = strdup("\"message\" : \"invalid uri or endpoint being passed\"");
-                json->Status = BAD_REQUEST;
-            }
-        }
+        // if (is_just_id(Request->uri + 7))
+        // {
+        //     json = handle_put_with_id(atoi(Request->uri + 7), Request->header_info->body);
+        // }
+        json = handle_update_current_user((const char *)Request->header_info->body);
     }
     if (!json)
     {
@@ -389,7 +407,7 @@ int is_just_id(const char *data)
     }
     return 1;
 }
-JSON_RESPONSE *handle_get_uri(const char *uri, uri_t uri_enum)
+JSON_RESPONSE *handle_get_uri(struct httpRequest *Request, uri_t uri_enum)
 {
     JSON_RESPONSE *json = NULL;
     switch (uri_enum)
@@ -401,7 +419,10 @@ JSON_RESPONSE *handle_get_uri(const char *uri, uri_t uri_enum)
         json = handle_get_users();
         break;
     case URI_USERS_WITH_ID:
-        json = handle_user_with_id(atoi(uri + 7));
+        json = handle_user_with_id(atoi(Request->uri + 7));
+        break;
+    case URI_USER_INFO:
+        json = get_user_info();
         break;
     default:
         json = NULL;
@@ -444,6 +465,42 @@ int make_hashed_password(char *original_pass, char *hashed_pass, const char *sal
     return 0;
 }
 
+char *get_token(const char *body)
+{
+    const char *start = strstr(body, "Authorization: Bearer ");
+    if (start)
+    {
+        start += strlen("Authorization: Bearer ");
+        char *end = strstr(start, "\r\n");
+        int len = end - start;
+        char *token = (char *)malloc(len + 1);
+        if (token)
+        {
+            strncpy(token, start, len);
+            token[len] = '\0';
+            return token;
+        }
+        else
+            return NULL;
+    }
+    return NULL;
+}
+
+int is_expired(jwt_t *my_jwt, const char *exp)
+{
+    time_t expiry = jwt_get_grant_int(my_jwt, exp);
+    if (expiry < time(NULL))
+        return 0;
+    return 1;
+}
+
+jwt_t *get_decoded_token(char *token)
+{
+    jwt_t *my_jwt;
+    char *secret = getenv("SECRET_KEY");
+    size_t sec_len = strlen(secret);
+    return (!jwt_decode(&my_jwt, (const char *)token, (const unsigned char *)secret, (int)sec_len)) ? my_jwt : NULL;
+}
 void serve_file(socket_t fd, const char *path)
 {
     int file_fd = open(path, O_RDONLY);

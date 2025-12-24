@@ -1,0 +1,1376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Profile - Chat App</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #0f0f0f;
+            min-height: 100vh;
+            color: #fff;
+            transition: background 0.4s ease, color 0.4s ease;
+        }
+
+        body.light {
+            background: #f8fafc;
+            color: #1e293b;
+        }
+
+        /* Navbar */
+        .navbar {
+            background: rgba(20, 20, 20, 0.95);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 0;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            transition: all 0.4s;
+        }
+
+        body.light .navbar {
+            background: rgba(255, 255, 255, 0.95);
+            border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+        }
+
+        .nav-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .nav-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .nav-logo {
+            width: 36px;
+            height: 36px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        .nav-brand h2 {
+            font-size: 20px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .nav-menu {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .nav-link {
+            color: rgba(255, 255, 255, 0.7);
+            text-decoration: none;
+            padding: 10px 16px;
+            border-radius: 8px;
+            transition: all 0.3s;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        body.light .nav-link {
+            color: rgba(0, 0, 0, 0.7);
+        }
+
+        .nav-link:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: #fff;
+        }
+
+        body.light .nav-link:hover {
+            background: rgba(0, 0, 0, 0.1);
+            color: #000;
+        }
+
+        .nav-link.active {
+            background: rgba(102, 126, 234, 0.2);
+            color: #667eea;
+        }
+
+        body.light .nav-link.active {
+            background: rgba(102, 126, 234, 0.15);
+            color: #667eea;
+        }
+
+        .logout-btn {
+            background: rgba(255, 255, 255, 0.1);
+            color: #fff;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+
+        body.light .logout-btn {
+            background: rgba(0, 0, 0, 0.1);
+            color: #000;
+            border-color: rgba(0, 0, 0, 0.2);
+        }
+
+        .logout-btn:hover {
+            background: rgba(220, 38, 38, 0.2);
+            border-color: #dc2626;
+            color: #dc2626;
+        }
+
+        /* Loading Screen */
+        .loading-screen {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: calc(100vh - 70px);
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .spinner {
+            border: 3px solid rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            border-top: 3px solid #667eea;
+            width: 48px;
+            height: 48px;
+            animation: spin 0.8s linear infinite;
+        }
+
+        body.light .spinner {
+            border-color: rgba(0, 0, 0, 0.1);
+            border-top-color: #667eea;
+        }
+
+        .loading-text {
+            color: rgba(255, 255, 255, 0.7);
+            font-weight: 600;
+            font-size: 16px;
+        }
+
+        body.light .loading-text {
+            color: rgba(0, 0, 0, 0.7);
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Main Container */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px 24px;
+        }
+
+        .profile-container {
+            display: none;
+        }
+
+        /* Profile Header */
+        .profile-header {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            padding: 48px;
+            margin-bottom: 32px;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.4s;
+        }
+
+        body.light .profile-header {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 100%);
+            border-color: rgba(0, 0, 0, 0.1);
+        }
+
+        .profile-header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            right: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(102, 126, 234, 0.15) 0%, transparent 70%);
+            animation: pulse 8s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 0.5; }
+            50% { transform: scale(1.2); opacity: 0.8; }
+        }
+
+        .profile-header-content {
+            position: relative;
+            z-index: 1;
+            display: flex;
+            align-items: center;
+            gap: 32px;
+        }
+
+        .profile-avatar-wrapper {
+            position: relative;
+        }
+
+        .profile-avatar {
+            width: 140px;
+            height: 140px;
+            border-radius: 50%;
+            border: 4px solid rgba(255, 255, 255, 0.2);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+
+        body.light .profile-avatar {
+            border-color: rgba(0, 0, 0, 0.2);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+        }
+
+        .profile-avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .profile-avatar-placeholder {
+            font-size: 56px;
+            color: white;
+            font-weight: 700;
+        }
+
+        .avatar-status {
+            position: absolute;
+            bottom: 8px;
+            right: 8px;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: #10b981;
+            border: 3px solid #0f0f0f;
+            box-shadow: 0 0 12px rgba(16, 185, 129, 0.6);
+        }
+
+        body.light .avatar-status {
+            border-color: #f8fafc;
+        }
+
+        .avatar-upload {
+            position: absolute;
+            bottom: -4px;
+            right: -4px;
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: 3px solid #0f0f0f;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            transition: all 0.3s;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        body.light .avatar-upload {
+            border-color: #f8fafc;
+        }
+
+        .avatar-upload:hover {
+            transform: scale(1.1);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+        }
+
+        #avatarInput {
+            display: none;
+        }
+
+        .profile-info {
+            flex: 1;
+        }
+
+        .profile-name {
+            font-size: 36px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, #fff 0%, rgba(255, 255, 255, 0.8) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        body.light .profile-name {
+            background: linear-gradient(135deg, #1e293b 0%, rgba(30, 41, 59, 0.8) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .profile-username {
+            font-size: 18px;
+            color: rgba(255, 255, 255, 0.7);
+            margin-bottom: 16px;
+        }
+
+        body.light .profile-username {
+            color: rgba(30, 41, 59, 0.7);
+        }
+
+        .profile-meta {
+            display: flex;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        .meta-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 14px;
+        }
+
+        body.light .meta-item {
+            color: rgba(30, 41, 59, 0.7);
+        }
+
+        .profile-actions {
+            display: flex;
+            gap: 16px;
+        }
+
+        .action-btn {
+            background: rgba(255, 255, 255, 0.1);
+            color: #fff;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 12px 24px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 14px;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        body.light .action-btn {
+            background: rgba(0, 0, 0, 0.1);
+            color: #1e293b;
+            border-color: rgba(0, 0, 0, 0.2);
+        }
+
+        .action-btn:hover {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.2) 0%, rgba(118, 75, 162, 0.2) 100%);
+            border-color: rgba(102, 126, 234, 0.4);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
+        }
+
+        body.light .action-btn:hover {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 100%);
+            border-color: rgba(102, 126, 234, 0.3);
+        }
+
+        /* Sections */
+        .section {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 32px;
+            margin-bottom: 24px;
+            transition: all 0.4s;
+        }
+
+        body.light .section {
+            background: rgba(0, 0, 0, 0.05);
+            border-color: rgba(0, 0, 0, 0.1);
+        }
+
+        .section-title {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 24px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .section-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 24px;
+        }
+
+        .detail-card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s;
+        }
+
+        body.light .detail-card {
+            background: rgba(0, 0, 0, 0.05);
+            border-color: rgba(0, 0, 0, 0.1);
+        }
+
+        .detail-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+        }
+
+        body.light .detail-card:hover {
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+        }
+
+        .detail-label {
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.6);
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        body.light .detail-label {
+            color: rgba(30, 41, 59, 0.6);
+        }
+
+        .detail-value {
+            font-size: 16px;
+            font-weight: 500;
+            word-break: break-all;
+        }
+
+        /* Security Section */
+        .setting-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        body.light .setting-item {
+            border-bottom-color: rgba(0, 0, 0, 0.1);
+        }
+
+        .setting-item:last-child {
+            border-bottom: none;
+        }
+
+        .setting-item:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        body.light .setting-item:hover {
+            background: rgba(0, 0, 0, 0.05);
+        }
+
+        .setting-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .setting-icon {
+            width: 40px;
+            height: 40px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        body.light .setting-icon {
+            background: rgba(0, 0, 0, 0.1);
+        }
+
+        .setting-info h4 {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .setting-info p {
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        body.light .setting-info p {
+            color: rgba(30, 41, 59, 0.6);
+        }
+
+        .setting-arrow {
+            color: rgba(255, 255, 255, 0.4);
+            font-size: 20px;
+        }
+
+        body.light .setting-arrow {
+            color: rgba(30, 41, 59, 0.4);
+        }
+
+        /* Toggle Switch */
+        .toggle {
+            width: 40px;
+            height: 20px;
+            background: #4b5563;
+            border-radius: 20px;
+            position: relative;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        .toggle.active {
+            background: #667eea; /* Remains blue in both themes */
+        }
+
+        .toggle::before {
+            content: '';
+            position: absolute;
+            width: 18px;
+            height: 18px;
+            background: #fff;
+            border-radius: 50%;
+            top: 1px;
+            left: 1px;
+            transition: transform 0.3s;
+        }
+
+        .toggle.active::before {
+            transform: translateX(20px);
+        }
+
+        body.light .toggle {
+            background: #d1d5db; /* Light gray for off state in light mode */
+        }
+
+        body.light .toggle.active {
+            background: #667eea; /* Still blue for on state */
+        }
+
+        body.light .toggle::before {
+            background: #fff;
+        }
+
+        /* Error Screen */
+        .error-screen {
+            display: none;
+            justify-content: center;
+            align-items: center;
+            min-height: calc(100vh - 70px);
+            flex-direction: column;
+            gap: 20px;
+            text-align: center;
+            padding: 0 24px;
+        }
+
+        .error-icon {
+            font-size: 64px;
+            color: #ef4444;
+        }
+
+        .error-message {
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        .error-description {
+            color: rgba(255, 255, 255, 0.7);
+            max-width: 400px;
+        }
+
+        body.light .error-description {
+            color: rgba(30, 41, 59, 0.7);
+        }
+
+        .retry-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        .retry-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        /* Modals */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 10000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0,0,0,0.5);
+            justify-content: center;
+            align-items: center;
+            transition: opacity 0.3s;
+        }
+
+        body.light .modal {
+            background-color: rgba(255,255,255,0.5);
+        }
+
+        .modal-content {
+            background: #1e293b;
+            margin: 15% auto;
+            padding: 32px;
+            border-radius: 16px;
+            width: 90%;
+            max-width: 400px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+            position: relative;
+            animation: modalFade 0.3s;
+        }
+
+        body.light .modal-content {
+            background: #fff;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+        }
+
+        @keyframes modalFade {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .modal-header {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 24px;
+            color: #fff;
+        }
+
+        body.light .modal-header {
+            color: #1e293b;
+        }
+
+        .modal-form .form-group {
+            margin-bottom: 20px;
+        }
+
+        .modal-form label {
+            display: block;
+            margin-bottom: 8px;
+            color: rgba(255,255,255,0.7);
+            font-weight: 500;
+        }
+
+        body.light .modal-form label {
+            color: rgba(30,41,59,0.7);
+        }
+
+        .modal-form input {
+            width: 100%;
+            padding: 12px;
+            background: rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 8px;
+            color: #fff;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+
+        body.light .modal-form input {
+            background: rgba(0,0,0,0.05);
+            border-color: rgba(0,0,0,0.1);
+            color: #1e293b;
+        }
+
+        .modal-form input:focus {
+            border-color: #667eea;
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 16px;
+            margin-top: 24px;
+        }
+
+        .modal-btn {
+            flex: 1;
+            padding: 12px;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            border: none;
+        }
+
+        .modal-btn.primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+        }
+
+        .modal-btn.primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102,126,234,0.4);
+        }
+
+        .modal-btn.secondary {
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+
+        body.light .modal-btn.secondary {
+            background: rgba(0,0,0,0.05);
+            color: #1e293b;
+            border-color: rgba(0,0,0,0.1);
+        }
+
+        .modal-btn.secondary:hover {
+            background: rgba(255,255,255,0.2);
+        }
+
+        body.light .modal-btn.secondary:hover {
+            background: rgba(0,0,0,0.1);
+        }
+
+        .modal-close {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            color: rgba(255,255,255,0.5);
+            font-size: 24px;
+            cursor: pointer;
+            transition: color 0.3s;
+        }
+
+        body.light .modal-close {
+            color: rgba(0,0,0,0.5);
+        }
+
+        .modal-close:hover {
+            color: #ef4444;
+        }
+
+        .modal p {
+            color: #fff;
+            text-align: center;
+            margin-bottom: 24px;
+        }
+
+        body.light .modal p {
+            color: #1e293b;
+        }
+
+        /* Error in Modal */
+        .modal-error {
+            color: #ef4444;
+            font-size: 14px;
+            margin-top: 8px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="nav-brand">
+                <div class="nav-logo">💬</div>
+                <h2>ChatApp</h2>
+            </div>
+            <div class="nav-menu">
+                <a href="#" class="nav-link">Home</a>
+                <a href="#" class="nav-link">Chats</a>
+                <a href="#" class="nav-link active">Profile</a>
+                <button class="logout-btn" onclick="showLogoutModal()">Logout</button>
+            </div>
+        </div>
+    </nav>
+
+    <div id="loadingScreen" class="loading-screen">
+        <div class="spinner"></div>
+        <p class="loading-text">Loading Profile...</p>
+    </div>
+
+    <div id="errorScreen" class="error-screen">
+        <div class="error-icon">⚠️</div>
+        <h2 class="error-message">Error Loading Profile</h2>
+        <p id="errorMessage" class="error-description"></p>
+        <button class="retry-btn" onclick="fetchProfile()">Retry</button>
+    </div>
+
+    <div id="profileContainer" class="profile-container">
+        <div class="container">
+            <div class="profile-header">
+                <div class="profile-header-content">
+                    <div class="profile-avatar-wrapper">
+                        <div class="profile-avatar">
+                            <img id="avatarImage" src="" alt="Profile" style="display: none;">
+                            <span id="avatarPlaceholder" class="profile-avatar-placeholder">U</span>
+                        </div>
+                        <div class="avatar-status"></div>
+                        <label for="avatarInput" class="avatar-upload">📷</label>
+                        <input type="file" id="avatarInput" accept="image/*">
+                    </div>
+                    <div class="profile-info">
+                        <h1 id="profileName" class="profile-name">Loading...</h1>
+                        <p id="profileUsername" class="profile-username">@username</p>
+                        <div class="profile-meta">
+                            <div class="meta-item">
+                                <span>📧</span>
+                                <span id="profileEmail">email@example.com</span>
+                            </div>
+                            <div class="meta-item">
+                                <span>🆔</span>
+                                <span id="userIdMeta">#0000</span>
+                            </div>
+                            <div class="meta-item">
+                                <span>📅</span>
+                                <span>Joined <span id="joinedDate">2023</span></span>
+                            </div>
+                        </div>
+                        <div class="profile-actions">
+                            <button class="action-btn" onclick="editProfile()">
+                                ✏️ Edit Profile
+                            </button>
+                            <button class="action-btn" onclick="shareProfile()">
+                                🔗 Share Profile
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3 class="section-title">📋 Account Details</h3>
+                <div class="section-grid">
+                    <div class="detail-card">
+                        <p class="detail-label">👤 Full Name</p>
+                        <p id="detailName" class="detail-value">Loading...</p>
+                    </div>
+                    <div class="detail-card">
+                        <p class="detail-label">🆔 Username</p>
+                        <p id="detailUsername" class="detail-value">username</p>
+                    </div>
+                    <div class="detail-card">
+                        <p class="detail-label">📧 Email</p>
+                        <p id="detailEmail" class="detail-value">email@example.com</p>
+                    </div>
+                    <div class="detail-card">
+                        <p class="detail-label">🔢 User ID</p>
+                        <p id="detailId" class="detail-value">0000</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3 class="section-title">🔒 Security & Privacy</h3>
+                <div class="settings-list">
+                    <div class="setting-item" onclick="changePassword()">
+                        <div class="setting-left">
+                            <div class="setting-icon">🔑</div>
+                            <div class="setting-info">
+                                <h4>Change Password</h4>
+                                <p>Update your password</p>
+                            </div>
+                        </div>
+                        <span class="setting-arrow">›</span>
+                    </div>
+
+                    <div class="setting-item" onclick="manageSessions()">
+                        <div class="setting-left">
+                            <div class="setting-icon">📱</div>
+                            <div class="setting-info">
+                                <h4>Active Sessions</h4>
+                                <p>Manage logged in devices</p>
+                            </div>
+                        </div>
+                        <span class="setting-arrow">›</span>
+                    </div>
+
+                    <div class="setting-item" onclick="blockedUsers()">
+                        <div class="setting-left">
+                            <div class="setting-icon">🚫</div>
+                            <div class="setting-info">
+                                <h4>Blocked Users</h4>
+                                <p>Manage blocked contacts</p>
+                            </div>
+                        </div>
+                        <span class="setting-arrow">›</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3 class="section-title">⚙️ Preferences</h3>
+                <div class="settings-list">
+                    <div class="setting-item" onclick="changeTheme()">
+                        <div class="setting-left">
+                            <div class="setting-icon">🎨</div>
+                            <div class="setting-info">
+                                <h4>Theme</h4>
+                                <p>Purple Gradient</p>
+                            </div>
+                        </div>
+                        <span class="setting-arrow">›</span>
+                    </div>
+
+                    <div class="setting-item" onclick="changeFontSize()">
+                        <div class="setting-left">
+                            <div class="setting-icon">🔤</div>
+                            <div class="setting-info">
+                                <h4>Font Size</h4>
+                                <p>Medium</p>
+                            </div>
+                        </div>
+                        <span class="setting-arrow">›</span>
+                    </div>
+
+                    <div class="setting-item" onclick="toggleSetting(this)" id="darkModeToggleItem">
+                        <div class="setting-left">
+                            <div class="setting-icon">🌙</div>
+                            <div class="setting-info">
+                                <h4>Dark Mode</h4>
+                                <p>Toggle dark/light theme</p>
+                            </div>
+                        </div>
+                        <div class="toggle active" id="darkModeToggle"></div>
+                    </div>
+
+                    <div class="setting-item" onclick="toggleSetting(this)">
+                        <div class="setting-left">
+                            <div class="setting-icon">✨</div>
+                            <div class="setting-info">
+                                <h4>Animations</h4>
+                                <p>Enable smooth transitions</p>
+                            </div>
+                        </div>
+                        <div class="toggle active"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Logout Confirmation Modal -->
+    <div id="logoutModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hideLogoutModal()">&times;</span>
+            <p>Are you sure you want to logout?</p>
+            <div class="modal-actions">
+                <button class="modal-btn secondary" onclick="hideLogoutModal()">No</button>
+                <button class="modal-btn primary" onclick="confirmLogout()">Yes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Profile Modal -->
+    <div id="editProfileModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hideEditProfileModal()">&times;</span>
+            <h3 class="modal-header">Edit Profile</h3>
+            <form id="editProfileForm" class="modal-form">
+                <div class="form-group">
+                    <label for="editName">Full Name</label>
+                    <input type="text" id="editName" required>
+                </div>
+                <div class="form-group">
+                    <label for="editUsername">Username</label>
+                    <input type="text" id="editUsername" required>
+                </div>
+                <div class="form-group">
+                    <label for="editEmail">Email</label>
+                    <input type="email" id="editEmail" required>
+                </div>
+                <div class="form-group">
+                    <label for="editPassword">New Password (optional)</label>
+                    <input type="password" id="editPassword">
+                </div>
+                <p id="editError" class="modal-error"></p>
+                <div class="modal-actions">
+                    <button type="button" class="modal-btn secondary" onclick="hideEditProfileModal()">Cancel</button>
+                    <button type="submit" class="modal-btn primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Change Password Modal -->
+    <div id="changePasswordModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hideChangePasswordModal()">&times;</span>
+            <h3 class="modal-header">Change Password</h3>
+            <form id="changePasswordForm" class="modal-form">
+                <div class="form-group">
+                    <label for="currentPassword">Current Password</label>
+                    <input type="password" id="currentPassword" required>
+                </div>
+                <div class="form-group">
+                    <label for="newPassword">New Password</label>
+                    <input type="password" id="newPassword" required>
+                </div>
+                <div class="form-group">
+                    <label for="confirmNewPassword">Confirm New Password</label>
+                    <input type="password" id="confirmNewPassword" required>
+                </div>
+                <p id="passwordError" class="modal-error"></p>
+                <div class="modal-actions">
+                    <button type="button" class="modal-btn secondary" onclick="hideChangePasswordModal()">Cancel</button>
+                    <button type="submit" class="modal-btn primary">Update Password</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Manage Sessions Modal (Placeholder) -->
+    <div id="manageSessionsModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hideManageSessionsModal()">&times;</span>
+            <h3 class="modal-header">Active Sessions</h3>
+            <p>Here you can view and manage your active devices. (Backend implementation pending)</p>
+            <div class="modal-actions">
+                <button class="modal-btn primary" onclick="hideManageSessionsModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Blocked Users Modal (Placeholder) -->
+    <div id="blockedUsersModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hideBlockedUsersModal()">&times;</span>
+            <h3 class="modal-header">Blocked Users</h3>
+            <p>Here you can view and manage blocked users. (Backend implementation pending)</p>
+            <div class="modal-actions">
+                <button class="modal-btn primary" onclick="hideBlockedUsersModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Check authentication
+        function checkAuth() {
+            const token = localStorage.getItem('token');
+            if (!token) {
+                showError('No authentication token found. Please login.');
+                return false;
+            }
+            return true;
+        }
+
+        // Fetch user profile
+        async function fetchProfile() {
+            const token = localStorage.getItem('token');
+            
+            try {
+                const response = await fetch('/me', {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.id) {
+                    displayProfile(data);
+                } else {
+                    showError(data.message || 'Failed to load profile');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showError('Network error. Please try again.');
+            }
+        }
+
+        // Display profile - now consistent across all fields
+        function displayProfile(data) {
+            document.getElementById('loadingScreen').style.display = 'none';
+            document.getElementById('profileContainer').style.display = 'block';
+
+            const name = data.name || 'Unknown User';
+            const username = data.username || 'username';
+            const email = data.email || 'No email';
+
+            const initials = name ? name.charAt(0).toUpperCase() : 'U';
+            document.getElementById('avatarPlaceholder').textContent = initials;
+
+            document.getElementById('profileName').textContent = name;
+            document.getElementById('profileUsername').textContent = `@${username}`;
+            document.getElementById('profileEmail').textContent = email;
+            document.getElementById('userIdMeta').textContent = `#${data.id || '0'}`;
+            document.getElementById('joinedDate').textContent = new Date(data.createdAt || Date.now()).getFullYear();
+
+            // Consistent values in Account Details (no more "-")
+            document.getElementById('detailName').textContent = name;
+            document.getElementById('detailUsername').textContent = username;
+            document.getElementById('detailEmail').textContent = email;
+            document.getElementById('detailId').textContent = data.id || '0';
+
+            // Pre-fill edit form
+            document.getElementById('editName').value = name;
+            document.getElementById('editUsername').value = username;
+            document.getElementById('editEmail').value = email;
+
+            // Load saved avatar
+            const savedAvatar = localStorage.getItem('profileAvatar');
+            if (savedAvatar) {
+                document.getElementById('avatarImage').src = savedAvatar;
+                document.getElementById('avatarImage').style.display = 'block';
+                document.getElementById('avatarPlaceholder').style.display = 'none';
+            }
+        }
+
+        // Avatar upload
+        document.getElementById('avatarInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const imageData = e.target.result;
+                    document.getElementById('avatarImage').src = imageData;
+                    document.getElementById('avatarImage').style.display = 'block';
+                    document.getElementById('avatarPlaceholder').style.display = 'none';
+                    localStorage.setItem('profileAvatar', imageData);
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+
+        // Show error
+        function showError(message) {
+            document.getElementById('loadingScreen').style.display = 'none';
+            document.getElementById('profileContainer').style.display = 'none';
+            document.getElementById('errorScreen').style.display = 'flex';
+            document.getElementById('errorMessage').textContent = message;
+        }
+
+        // Logout functions
+        function showLogoutModal() {
+            document.getElementById('logoutModal').style.display = 'flex';
+        }
+
+        function hideLogoutModal() {
+            document.getElementById('logoutModal').style.display = 'none';
+        }
+
+        function confirmLogout() {
+            localStorage.removeItem('token');
+            localStorage.removeItem('profileAvatar');
+            localStorage.removeItem('darkMode');
+            window.location.href = '/login';
+        }
+
+        // Edit profile
+        function editProfile() {
+            document.getElementById('editProfileModal').style.display = 'flex';
+        }
+
+        function hideEditProfileModal() {
+            document.getElementById('editProfileModal').style.display = 'none';
+            document.getElementById('editError').style.display = 'none';
+        }
+
+        document.getElementById('editProfileForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const token = localStorage.getItem('token');
+            const name = document.getElementById('editName').value;
+            const username = document.getElementById('editUsername').value;
+            const email = document.getElementById('editEmail').value;
+            const password = document.getElementById('editPassword').value;
+
+            const body = { name, username, email };
+            if (password) body.password = password;
+
+            try {
+                const response = await fetch('/me', {
+                    method: 'PUT',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(body)
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    hideEditProfileModal();
+                    fetchProfile(); // Refresh profile
+                } else {
+                    document.getElementById('editError').textContent = data.message || 'Failed to update profile';
+                    document.getElementById('editError').style.display = 'block';
+                }
+            } catch (error) {
+                document.getElementById('editError').textContent = 'Network error. Please try again.';
+                document.getElementById('editError').style.display = 'block';
+            }
+        });
+
+        // Share profile
+        function shareProfile() {
+            const username = document.getElementById('profileUsername').textContent.replace('@', '');
+            const profileUrl = `${window.location.origin}/user/${username}`;
+            
+            if (navigator.share) {
+                navigator.share({
+                    title: 'My Chat Profile',
+                    text: `Connect with me on ChatApp!`,
+                    url: profileUrl
+                });
+            } else {
+                navigator.clipboard.writeText(profileUrl);
+                alert('✅ Profile link copied to clipboard!');
+            }
+        }
+
+        // Change password
+        function changePassword() {
+            document.getElementById('changePasswordModal').style.display = 'flex';
+        }
+
+        function hideChangePasswordModal() {
+            document.getElementById('changePasswordModal').style.display = 'none';
+            document.getElementById('passwordError').style.display = 'none';
+        }
+
+        document.getElementById('changePasswordForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const token = localStorage.getItem('token');
+            const currentPassword = document.getElementById('currentPassword').value;
+            const newPassword = document.getElementById('newPassword').value;
+            const confirmNewPassword = document.getElementById('confirmNewPassword').value;
+
+            if (newPassword !== confirmNewPassword) {
+                document.getElementById('passwordError').textContent = 'Passwords do not match';
+                document.getElementById('passwordError').style.display = 'block';
+                return;
+            }
+
+            try {
+                const response = await fetch('/change-password', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ currentPassword, newPassword })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    hideChangePasswordModal();
+                    alert('Password updated successfully');
+                } else {
+                    document.getElementById('passwordError').textContent = data.message || 'Failed to update password';
+                    document.getElementById('passwordError').style.display = 'block';
+                }
+            } catch (error) {
+                document.getElementById('passwordError').textContent = 'Network error. Please try again.';
+                document.getElementById('passwordError').style.display = 'block';
+            }
+        });
+
+        // Manage sessions (placeholder)
+        function manageSessions() {
+            document.getElementById('manageSessionsModal').style.display = 'flex';
+        }
+
+        function hideManageSessionsModal() {
+            document.getElementById('manageSessionsModal').style.display = 'none';
+        }
+
+        // Blocked users (placeholder)
+        function blockedUsers() {
+            document.getElementById('blockedUsersModal').style.display = 'flex';
+        }
+
+        function hideBlockedUsersModal() {
+            document.getElementById('blockedUsersModal').style.display = 'none';
+        }
+
+        // Toggle any setting (including Dark Mode)
+        function toggleSetting(element) {
+            const toggle = element.querySelector('.toggle');
+            if (toggle) {
+                toggle.classList.toggle('active');
+
+                // Handle Dark Mode specifically
+                if (element.id === 'darkModeToggleItem') {
+                    const isDark = toggle.classList.contains('active');
+                    if (isDark) {
+                        document.body.classList.remove('light');
+                        localStorage.setItem('darkMode', 'true');
+                    } else {
+                        document.body.classList.add('light');
+                        localStorage.setItem('darkMode', 'false');
+                    }
+                }
+            }
+        }
+
+        // Placeholder functions
+        function changeTheme() {
+            alert('🌈 Theme Selection\n\nChoose from:\n• Purple Gradient (Current)\n• Blue Ocean\n• Green Forest\n• Orange Sunset');
+        }
+
+        function changeFontSize() {
+            alert('📏 Font Size\n\nSelect size:\n• Small\n• Medium (Current)\n• Large');
+        }
+
+        // Initialize theme and profile
+        window.addEventListener('DOMContentLoaded', () => {
+            // Apply saved theme
+            const savedDarkMode = localStorage.getItem('darkMode');
+            if (savedDarkMode === 'false') {
+                document.body.classList.add('light');
+                document.getElementById('darkModeToggle')?.classList.remove('active');
+            } else {
+                document.body.classList.remove('light');
+                document.getElementById('darkModeToggle')?.classList.add('active');
+            }
+
+            if (checkAuth()) {
+                fetchProfile();
+            }
+        });
+    </script>
+</body>
+</html>

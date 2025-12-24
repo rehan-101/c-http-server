@@ -3,310 +3,353 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Register</title>
+    <title>Register - ChatApp</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             display: flex;
-            justify-content: center;
             align-items: center;
+            justify-content: center;
             padding: 20px;
+            position: relative;
+            overflow: hidden;
+            background: #0a0918;
+        }
+
+        canvas#plexus {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            z-index: -1;
         }
 
         .container {
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(16px);
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
             padding: 40px;
             width: 100%;
-            max-width: 400px;
+            max-width: 420px;
+            position: relative;
+            z-index: 1;
+            animation: fadeInUp 1s ease-out;
         }
 
-        h1 {
-            color: #333;
-            margin-bottom: 10px;
-            text-align: center;
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(40px); }
+            to { opacity: 1; transform: translateY(0); }
         }
 
-        .subtitle {
-            color: #666;
+        h1 { text-align: center; color: #333; margin-bottom: 8px; font-size: 28px; }
+        .subtitle { text-align: center; color: #666; margin-bottom: 30px; font-size: 15px; }
+
+        /* Updated Avatar Section - Clean & Clickable */
+        .avatar-section {
             text-align: center;
             margin-bottom: 30px;
-            font-size: 14px;
+            position: relative;
         }
 
-        .form-group {
-            margin-bottom: 20px;
+        .avatar-wrapper {
+            position: relative;
+            display: inline-block;
+            cursor: pointer;
         }
 
-        label {
-            display: block;
-            margin-bottom: 8px;
-            color: #333;
-            font-weight: 500;
-            font-size: 14px;
+        .avatar-preview {
+            width: 140px;
+            height: 140px;
+            border-radius: 50%;
+            background: #e2e8f0;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 4px dashed #cbd5e0;
+            transition: all 0.3s ease;
         }
 
-        input {
-            width: 100%;
-            padding: 12px 15px;
-            border: 2px solid #e1e8ed;
-            border-radius: 6px;
-            font-size: 14px;
-            transition: border-color 0.3s;
-        }
-
-        input:focus {
-            outline: none;
+        .avatar-preview:hover {
             border-color: #667eea;
+            background: #f1f5f9;
         }
+
+        .avatar-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .avatar-placeholder {
+            font-size: 60px;
+            color: #94a3b8;
+            font-weight: bold;
+        }
+
+        .camera-overlay {
+            position: absolute;
+            bottom: 8px;
+            right: 8px;
+            width: 40px;
+            height: 40px;
+            background: #667eea;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            color: white;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .avatar-label {
+            display: block;
+            margin-top: 12px;
+            color: #666;
+            font-size: 14px;
+        }
+
+        /* Rest of styles unchanged */
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; color: #444; font-weight: 500; }
+        input[type="text"], input[type="email"], input[type="password"] {
+            width: 100%; padding: 14px; border: 2px solid #e2e8f0;
+            border-radius: 10px; font-size: 16px; transition: all 0.3s ease;
+        }
+        input:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 4px rgba(102,126,234,0.25); }
 
         .btn {
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 6px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
+            width: 100%; padding: 16px; background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white; border: none; border-radius: 10px; font-size: 17px;
+            font-weight: 600; cursor: pointer; margin-top: 10px; transition: all 0.4s ease;
         }
+        .btn:hover { transform: translateY(-4px); box-shadow: 0 12px 30px rgba(102,126,234,0.5); }
 
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-        }
+        .message { padding: 14px; border-radius: 10px; margin-bottom: 20px; text-align: center; display: none; }
+        .message.error { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+        .message.success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
 
-        .btn:active {
-            transform: translateY(0);
-        }
+        .login-link { text-align: center; margin-top: 24px; color: #666; }
+        .login-link a { color: #667eea; text-decoration: none; font-weight: 600; }
+        .login-link a:hover { text-decoration: underline; }
 
-        .btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        .message {
-            padding: 12px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            font-size: 14px;
-            display: none;
-        }
-
-        .message.error {
-            background: #fee;
-            color: #c33;
-            border: 1px solid #fcc;
-        }
-
-        .message.success {
-            background: #efe;
-            color: #3c3;
-            border: 1px solid #cfc;
-        }
-
-        .login-link {
-            text-align: center;
-            margin-top: 20px;
-            color: #666;
-            font-size: 14px;
-        }
-
-        .login-link a {
-            color: #667eea;
-            text-decoration: none;
-            font-weight: 600;
-        }
-
-        .login-link a:hover {
-            text-decoration: underline;
-        }
-
-        .loading {
-            display: none;
-            text-align: center;
-            margin-top: 10px;
-            color: #667eea;
-        }
-
-        .password-strength {
-            margin-top: 5px;
-            font-size: 12px;
-            color: #666;
-        }
-
-        .strength-bar {
-            height: 4px;
-            background: #e1e8ed;
-            border-radius: 2px;
-            margin-top: 5px;
-            overflow: hidden;
-        }
-
-        .strength-fill {
-            height: 100%;
-            width: 0%;
-            transition: width 0.3s, background 0.3s;
-        }
-
-        .strength-weak { background: #f44336; width: 33%; }
-        .strength-medium { background: #ff9800; width: 66%; }
-        .strength-strong { background: #4caf50; width: 100%; }
+        .loading { text-align: center; color: #667eea; margin-top: 10px; display: none; }
     </style>
 </head>
 <body>
+    <canvas id="plexus"></canvas>
+
     <div class="container">
         <h1>Create Account</h1>
-        <p class="subtitle">Join us today</p>
-        
+        <p class="subtitle">Join ChatApp today</p>
+
         <div id="message" class="message"></div>
-        
+
         <form id="registerForm">
+            <!-- Updated Clean Avatar Upload -->
+            <div class="avatar-section">
+                <label class="avatar-wrapper">
+                    <div class="avatar-preview" id="avatarPreview">
+                        <div class="avatar-placeholder">+</div>
+                        <img id="avatarImage" src="" alt="Profile Preview" style="display:none;">
+                    </div>
+                    <div class="camera-overlay">📷</div>
+                    <input type="file" id="avatarInput" accept="image/*" style="display:none;">
+                </label>
+                <span class="avatar-label">Tap to add profile photo</span>
+            </div>
+
             <div class="form-group">
                 <label for="name">Full Name</label>
-                <input type="text" id="name" name="name" required>
+                <input type="text" id="name" required>
             </div>
 
             <div class="form-group">
                 <label for="username">Username</label>
-                <input type="text" id="username" name="username" required>
+                <input type="text" id="username" required>
             </div>
-            
+
             <div class="form-group">
                 <label for="email">Email</label>
-                <input type="email" id="email" name="email" required>
+                <input type="email" id="email" required>
             </div>
-            
+
             <div class="form-group">
                 <label for="password">Password</label>
-                <input type="password" id="password" name="password" required>
-                <div class="strength-bar">
-                    <div class="strength-fill" id="strengthFill"></div>
-                </div>
-                <div class="password-strength" id="passwordStrength"></div>
+                <input type="password" id="password" required minlength="6">
             </div>
-            
+
             <button type="submit" class="btn" id="submitBtn">Create Account</button>
-            <div class="loading" id="loading">Processing...</div>
+            <div class="loading" id="loading">Creating account...</div>
         </form>
-        
+
         <div class="login-link">
-            Already have an account? <a href="/login">Login here</a>
+            Already have an account? <a href="/login">Log in</a>
         </div>
     </div>
 
+    <!-- Neural Plexus Script (unchanged) -->
     <script>
+        const canvas = document.getElementById('plexus');
+        const ctx = canvas.getContext('2d');
+        let particles = [];
+        const numParticles = 80;
+        const maxDistance = 150;
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        resizeCanvas();
+
+        class Particle {
+            constructor() {
+                this.x = Math.random() * canvas.width;
+                this.y = Math.random() * canvas.height;
+                this.vx = (Math.random() - 0.5) * 0.5;
+                this.vy = (Math.random() - 0.5) * 0.5;
+                this.size = Math.random() * 3 + 1;
+            }
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                if (this.x < 0 || this.x > canvas.width) this.vx *= -1;
+                if (this.y < 0 || this.y > canvas.height) this.vy *= -1;
+            }
+            draw() {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(102, 126, 234, 0.9)';
+                ctx.fill();
+            }
+        }
+
+        function initParticles() {
+            particles = [];
+            for (let i = 0; i < numParticles; i++) particles.push(new Particle());
+        }
+        initParticles();
+
+        function connectParticles() {
+            for (let i = 0; i < particles.length; i++) {
+                for (let j = i + 1; j < particles.length; j++) {
+                    const dx = particles[i].x - particles[j].x;
+                    const dy = particles[i].y - particles[j].y;
+                    const dist = Math.hypot(dx, dy);
+                    if (dist < maxDistance) {
+                        ctx.beginPath();
+                        ctx.moveTo(particles[i].x, particles[i].y);
+                        ctx.lineTo(particles[j].x, particles[j].y);
+                        ctx.strokeStyle = `rgba(118, 75, 162, ${1 - dist / maxDistance})`;
+                        ctx.lineWidth = 1;
+                        ctx.stroke();
+                    }
+                }
+            }
+        }
+
+        function animate() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            particles.forEach(p => { p.update(); p.draw(); });
+            connectParticles();
+            requestAnimationFrame(animate);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            resizeCanvas();
+            initParticles();
+        });
+
+        // Updated Avatar Script
+        const avatarInput = document.getElementById('avatarInput');
+        const avatarImage = document.getElementById('avatarImage');
+        const avatarPlaceholder = document.querySelector('.avatar-placeholder');
+        const cameraOverlay = document.querySelector('.camera-overlay');
+
+        avatarInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                if (file.size > 5 * 1024 * 1024) {
+                    alert('Image must be under 5MB');
+                    return;
+                }
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    avatarImage.src = ev.target.result;
+                    avatarImage.style.display = 'block';
+                    avatarPlaceholder.style.display = 'none';
+                    cameraOverlay.style.display = 'none'; // Hide camera after upload
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+
+        // Register Form Script (unchanged)
         const form = document.getElementById('registerForm');
-        const messageDiv = document.getElementById('message');
+        const message = document.getElementById('message');
         const submitBtn = document.getElementById('submitBtn');
         const loading = document.getElementById('loading');
-        const passwordInput = document.getElementById('password');
-        const strengthFill = document.getElementById('strengthFill');
-        const strengthText = document.getElementById('passwordStrength');
 
         function showMessage(text, type) {
-            messageDiv.textContent = text;
-            messageDiv.className = `message ${type}`;
-            messageDiv.style.display = 'block';
+            message.textContent = text;
+            message.className = `message ${type}`;
+            message.style.display = 'block';
         }
+        
+form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    message.style.display = 'none';
 
-        function hideMessage() {
-            messageDiv.style.display = 'none';
-        }
+    const name = document.getElementById('name').value.trim();
+    const username = document.getElementById('username').value.trim();
+    const email = document.getElementById('email').value.trim();
+    const password = document.getElementById('password').value;
 
-        function checkPasswordStrength(password) {
-            let strength = 0;
-            if (password.length >= 8) strength++;
-            if (password.match(/[a-z]/) && password.match(/[A-Z]/)) strength++;
-            if (password.match(/[0-9]/)) strength++;
-            if (password.match(/[^a-zA-Z0-9]/)) strength++;
+    if (!name || !username || !email || !password) {
+        showMessage('All fields are required', 'error');
+        return;
+    }
 
-            strengthFill.className = 'strength-fill';
-            if (strength <= 1) {
-                strengthFill.classList.add('strength-weak');
-                strengthText.textContent = 'Weak password';
-            } else if (strength <= 3) {
-                strengthFill.classList.add('strength-medium');
-                strengthText.textContent = 'Medium password';
-            } else {
-                strengthFill.classList.add('strength-strong');
-                strengthText.textContent = 'Strong password';
-            }
-        }
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Creating...';
+    loading.style.display = 'block';
 
-        passwordInput.addEventListener('input', (e) => {
-            checkPasswordStrength(e.target.value);
+    try {
+        const payload = {
+            name,
+            username,
+            email,
+            password
+        };
+
+        const res = await fetch('/register', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
         });
 
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            hideMessage();
-            
-            const name = document.getElementById('name').value.trim();
-            const username = document.getElementById('username').value.trim();
-            const email = document.getElementById('email').value.trim();
-            const password = document.getElementById('password').value;
+        const data = await res.json();
 
-            if (!name || !username || !email || !password) {
-                showMessage('All fields are required', 'error');
-                return;
-            }
-
-            if (password.length < 6) {
-                showMessage('Password must be at least 6 characters', 'error');
-                return;
-            }
-
-            submitBtn.disabled = true;
-            submitBtn.textContent = 'Creating Account...';
-            loading.style.display = 'block';
-
-            try {
-                const response = await fetch('/register', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ name, username, email, password })
-                });
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showMessage(data.message || 'Registration successful!', 'success');
-                    form.reset();
-                    strengthFill.className = 'strength-fill';
-                    strengthText.textContent = '';
-                    
-                    setTimeout(() => {
-                        window.location.href = '/login';
-                    }, 2000);
-                } else {
-                    showMessage(data.error || 'Registration failed', 'error');
-                    submitBtn.disabled = false;
-                    submitBtn.textContent = 'Create Account';
-                    loading.style.display = 'none';
-                }
-            } catch (error) {
-                console.error('Error:', error);
-                showMessage('Network error. Please try again.', 'error');
-                submitBtn.disabled = false;
-                submitBtn.textContent = 'Create Account';
-                loading.style.display = 'none';
-            }
-        });
-    </script>
-</body>
-</html>
+        if (res.ok && data.success) {
+            showMessage('Account created! Redirecting to login...', 'success');
+            setTimeout(() => {
+                window.location.href = '/login';
+            }, 2000);
+        } else {
+            showMessage(data.error || 'Registration failed', 'error');
+        }
+    } catch (err) {
+        showMessage('Network error. Try again.', 'error');
+    } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Create Account';
+        loading.style.display = 'none';
+    }
+});
+</script>
