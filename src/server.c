@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/sendfile.h>
 #include <sqlite3.h>
+#include <pthread.h>
 
 Route routes[] = {
     {.method = GET, .enum_for_uri = {ROOT_URI, URI_USER_INFO, URI_USERS, URI_USERS_WITH_ID, URI_FOR_LOGIN, URI_FOR_REGISTRATION, URI_FOR_PROFILE, 0}, .handler = get_func},
@@ -57,8 +58,73 @@ struct Server server_constructor(int domain, int port, int service, int protocol
     db = start_db();
     return server_obj;
 }
+
+void *thread_func(void *arg)
+{
+    int new_socket = *(int *)arg;
+    char Buffer[BUFFER_SIZE];
+    ssize_t bytesRead = read(new_socket, Buffer, BUFFER_SIZE - 1);
+    if (bytesRead <= 0)
+    {
+        if (bytesRead < 0)
+            fprintf(stderr, "error in reading bytes");
+        close(new_socket);
+    }
+    Buffer[bytesRead] = '\0'; // Null terminate the string
+    puts(Buffer);
+    struct httpRequest *request = NULL;
+    request = parse_methods(Buffer);
+    if (request != NULL)
+    {
+        fprintf(stdout, "requested string --> %s\n method = %s , uri = %s\n", Buffer, request->enum_of_method == GET ? "GET" : (request->enum_of_method == POST) ? "POST"
+                                                                                                                           : (request->enum_of_method == PUT)    ? "PUT"
+                                                                                                                           : (request->enum_of_method == DELETE) ? "DELETE"
+                                                                                                                                                                 : "PATCH",
+                request->uri);
+        int method_found = 0;
+        int route_matched = 0;
+        for (int i = 0; i < no_of_routes; i++)
+        {
+            if (routes[i].method == request->enum_of_method)
+            {
+                method_found = 1;
+                int j = 0;
+                while (routes[i].enum_for_uri[j] != 0)
+                {
+                    if (routes[i].enum_for_uri[j] == request->enum_for_uri)
+                    {
+                        route_matched = 1;
+                        routes[i].handler(new_socket, request);
+                        goto done;
+                    }
+                    j++;
+                }
+            }
+        }
+        if (method_found && !route_matched)
+        {
+            send_json(new_socket, 404, "Not Found",
+                      "{\"error\":\"Wrong endpoint for this method\"}");
+        }
+        else if (!method_found)
+        {
+            send_json(new_socket, 405, "Method Not Allowed",
+                      "{\"error\":\"Method not supported\"}");
+        }
+    done:
+        clean_things(request->uri, request->header_info->body, request->header_info->content_type, request, NULL);
+    }
+    else
+    {
+        fprintf(stdout, "failed to parse reQuest...");
+        close(new_socket);
+    }
+    return NULL;
+}
+
 void listening_to_client(socket_t server_fd)
 {
+    pthread_t my_thread;
     char Buffer[BUFFER_SIZE];
     while (1)
     {
@@ -66,69 +132,28 @@ void listening_to_client(socket_t server_fd)
         printf("=== WAITING FOR CONNECTION === \n");
         struct sockaddr_in client_addr;
         socklen_t addrlen = sizeof(client_addr);
-        int new_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
-        if (new_socket < 0)
+        int *new_socket = (int *)malloc(sizeof(int));
+        if (!new_socket)
+        {
+            perror("mem alloc. failed..");
+            continue;
+        }
+        *new_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
+        if (*new_socket < 0)
         {
             perror("accept");
+            free(new_socket);
             continue;
         }
-        ssize_t bytesRead = read(new_socket, Buffer, BUFFER_SIZE - 1);
-        if (bytesRead <= 0)
+        else if (pthread_create(&my_thread, NULL, thread_func, (void *)new_socket) != 0)
         {
-            if (bytesRead < 0)
-                fprintf(stderr, "error in reading bytes");
-            close(new_socket);
+            perror("Thread failure");
+            close(*new_socket);
+            free(new_socket);
             continue;
         }
-        Buffer[bytesRead] = '\0'; // Null terminate the string
-        puts(Buffer);
-        struct httpRequest *request = NULL;
-        request = parse_methods(Buffer);
-        if (request != NULL)
-        {
-            fprintf(stdout, "requested string --> %s\n method = %s , uri = %s\n", Buffer, request->enum_of_method == GET ? "GET" : (request->enum_of_method == POST) ? "POST"
-                                                                                                                               : (request->enum_of_method == PUT)    ? "PUT"
-                                                                                                                               : (request->enum_of_method == DELETE) ? "DELETE"
-                                                                                                                                                                     : "PATCH",
-                    request->uri);
-            int method_found = 0;
-            int route_matched = 0;
-            for (int i = 0; i < no_of_routes; i++)
-            {
-                if (routes[i].method == request->enum_of_method)
-                {
-                    method_found = 1;
-                    int j = 0;
-                    while (routes[i].enum_for_uri[j] != 0)
-                    {
-                        if (routes[i].enum_for_uri[j] == request->enum_for_uri)
-                        {
-                            route_matched = 1;
-                            routes[i].handler(new_socket, request);
-                            goto done;
-                        }
-                        j++;
-                    }
-                }
-            }
-            if (method_found && !route_matched)
-            {
-                send_json(new_socket, 404, "Not Found",
-                          "{\"error\":\"Wrong endpoint for this method\"}");
-            }
-            else if (!method_found)
-            {
-                send_json(new_socket, 405, "Method Not Allowed",
-                          "{\"error\":\"Method not supported\"}");
-            }
-        done:
-            clean_things(request->uri, request->header_info->body, request->header_info->content_type, request, NULL);
-        }
-        else
-        {
-            fprintf(stdout, "failed to parse reQuest...");
-            close(new_socket);
-        }
+        fprintf(stdout, "received connection for socket : %d\n", *new_socket);
+        pthread_detach(my_thread);
     }
 }
 struct httpRequest *parse_methods(char *response)

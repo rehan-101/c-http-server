@@ -4,7 +4,7 @@ sqlite3 *db = NULL;
 sqlite3 *start_db()
 {
     char *err_msg = NULL;
-    int result = sqlite3_open("/home/rehan_syed/http_server/users.db", &db);
+    int result = sqlite3_open_v2("/home/rehan_syed/http_server/users.db", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
     if (result != SQLITE_OK)
     {
         fprintf(stderr, "Cannot open the sqlite file..(%s)", sqlite3_errmsg(db));
