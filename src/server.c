@@ -1,6 +1,7 @@
 #include "../include/server.h"
 #include "../include/json.h"
 #include "../include/database.h"
+#include "../include/websocket.h"
 #include <stdio.h>
 #include <jwt.h>
 #include <string.h>
@@ -13,8 +14,10 @@
 #include <sqlite3.h>
 #include <pthread.h>
 
+Client *clients = NULL;
+pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
 Route routes[] = {
-    {.method = GET, .enum_for_uri = {ROOT_URI, URI_USER_INFO, URI_USERS, URI_USERS_WITH_ID, URI_FOR_LOGIN, URI_FOR_REGISTRATION, URI_FOR_PROFILE, 0}, .handler = get_func},
+    {.method = GET, .enum_for_uri = {ROOT_URI, URI_USER_INFO, URI_USERS, URI_USERS_WITH_ID, URI_FOR_LOGIN, URI_FOR_REGISTRATION, URI_FOR_PROFILE, URI_FOR_CHAT, 0}, .handler = get_func},
     {.method = POST, .enum_for_uri = {URI_USERS, URI_FOR_REGISTRATION, URI_FOR_LOGIN, 0}, .handler = post_func},
     {.method = PUT, .enum_for_uri = {URI_USERS_WITH_ID, URI_USER_INFO, 0}, .handler = put_func},
     {.method = DELETE, .enum_for_uri = {URI_USERS_WITH_ID, 0}, .handler = delete_func},
@@ -45,6 +48,10 @@ struct Server server_constructor(int domain, int port, int service, int protocol
         perror("socket");
         exit(EXIT_FAILURE);
     }
+
+    int opt = 1;
+    setsockopt(server_obj.socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
     if (bind(server_obj.socket_fd, (struct sockaddr *)&server_obj.address, sizeof(server_obj.address)) < 0)
     {
         perror("bind");
@@ -55,23 +62,130 @@ struct Server server_constructor(int domain, int port, int service, int protocol
         perror("Failed to listen for connections...");
         exit(EXIT_FAILURE);
     }
+
+    /*SSL Initialization*/
+    init_openssl();
+    server_obj.ssl_ctx = create_ssl_context();
+    configure_ssl_context(server_obj.ssl_ctx);
+
     db = start_db();
     return server_obj;
 }
 
 void *thread_func(void *arg)
 {
-    int new_socket = *(int *)arg;
+    socket_wrapper_t *wrapper = (socket_wrapper_t *)arg;
+    int new_socket = wrapper->fd;
+    SSL *ssl = wrapper->ssl;
+    free(wrapper);
+
+    /*SSL Handshake is here*/
+    if (SSL_accept(ssl) <= 0)
+    {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        close(new_socket);
+        return NULL;
+    }
     char Buffer[BUFFER_SIZE];
-    ssize_t bytesRead = read(new_socket, Buffer, BUFFER_SIZE - 1);
+    ssize_t bytesRead = SSL_read(ssl, Buffer, BUFFER_SIZE - 1);
     if (bytesRead <= 0)
     {
         if (bytesRead < 0)
             fprintf(stderr, "error in reading bytes");
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
         close(new_socket);
+        return NULL;
     }
     Buffer[bytesRead] = '\0'; // Null terminate the string
     puts(Buffer);
+    // === Check for WebSocket upgrade ===
+    if (strstr(Buffer, "Upgrade: websocket") != NULL)
+    {
+        printf("websocket connection detected on socket #%d", new_socket);
+
+        if (ws_handshake(new_socket, ssl, Buffer) < 0)
+        {
+            fprintf(stderr, "WebSocket handshake failed\n");
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(new_socket);
+            return NULL;
+        }
+        static int client_id_counter = 1;
+        int client_id = client_id_counter++;
+        add_client_for_websock(new_socket, client_id, ssl);
+
+        printf("Client %d connected via WebSocket\n", client_id);
+
+        char welcome[256];
+        snprintf(welcome, sizeof(welcome),
+                 "{\"type\":\"system\",\"message\":\"Welcome! You are client #%d\"}",
+                 client_id);
+        ws_send_frame(new_socket, ssl, WS_OPCODE_TEXT, welcome, strlen(welcome));
+        char ws_buffer[BUFFER_SIZE];
+        while (1)
+        {
+            memset(ws_buffer, 0, sizeof(ws_buffer));
+            ssize_t bytes = SSL_read(ssl, ws_buffer, BUFFER_SIZE - 1);
+
+            if (bytes <= 0)
+            {
+                printf("Client %d disconnected\n", client_id);
+                break;
+            }
+
+            // Parse WebSocket frame
+            ws_frame_t *frame = ws_parse_frame((uint8_t *)ws_buffer, bytes);
+            if (!frame)
+            {
+                fprintf(stderr, "Failed to parse frame from client %d\n", client_id);
+                continue;
+            }
+
+            // Handle different frame types
+            switch (frame->opcode)
+            {
+            case WS_OPCODE_TEXT:
+                printf("Client %d: %s\n", client_id, frame->payload);
+
+                // Create JSON message
+                cJSON *msg_obj = cJSON_CreateObject();
+                cJSON_AddNumberToObject(msg_obj, "sender_id", client_id);
+                cJSON_AddStringToObject(msg_obj, "type", "message");
+                cJSON_AddStringToObject(msg_obj, "message", frame->payload);
+                cJSON_AddNumberToObject(msg_obj, "timestamp", time(NULL));
+
+                char *json_str = cJSON_PrintUnformatted(msg_obj);
+                ws_broadcast_message(json_str, new_socket);
+
+                free(json_str);
+                cJSON_Delete(msg_obj);
+                break;
+
+            case WS_OPCODE_PING:
+                ws_send_frame(new_socket, ssl, WS_OPCODE_PONG, frame->payload, frame->payload_len);
+                break;
+
+            case WS_OPCODE_CLOSE:
+                printf("Client %d requested close\n", client_id);
+                ws_send_frame(new_socket, ssl, WS_OPCODE_CLOSE, NULL, 0);
+                ws_free_frame(frame);
+                goto ws_cleanup;
+            }
+
+            ws_free_frame(frame);
+        }
+
+    ws_cleanup:
+        remove_client_for_websock(new_socket);
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        close(new_socket);
+        printf("Client %d handler thread exiting\n", client_id);
+        return NULL;
+    }
     struct httpRequest *request = NULL;
     request = parse_methods(Buffer);
     if (request != NULL)
@@ -94,7 +208,7 @@ void *thread_func(void *arg)
                     if (routes[i].enum_for_uri[j] == request->enum_for_uri)
                     {
                         route_matched = 1;
-                        routes[i].handler(new_socket, request);
+                        routes[i].handler(new_socket, ssl, request);
                         goto done;
                     }
                     j++;
@@ -103,22 +217,22 @@ void *thread_func(void *arg)
         }
         if (method_found && !route_matched)
         {
-            send_json(new_socket, 404, "Not Found",
+            send_json(new_socket, ssl, 404, "Not Found",
                       "{\"error\":\"Wrong endpoint for this method\"}");
         }
         else if (!method_found)
         {
-            send_json(new_socket, 405, "Method Not Allowed",
+            send_json(new_socket, ssl, 405, "Method Not Allowed",
                       "{\"error\":\"Method not supported\"}");
         }
     done:
         clean_things(request->uri, request->header_info->body, request->header_info->content_type, request, NULL);
     }
     else
-    {
         fprintf(stdout, "failed to parse reQuest...");
-        close(new_socket);
-    }
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(new_socket);
     return NULL;
 }
 
@@ -145,11 +259,36 @@ void listening_to_client(socket_t server_fd)
             free(new_socket);
             continue;
         }
-        else if (pthread_create(&my_thread, NULL, thread_func, (void *)new_socket) != 0)
+        /*Creating SSL wrapper*/
+        SSL *ssl = SSL_new(global_ssl_ctx);
+        if (ssl == NULL)
+        {
+            fprintf(stderr, "Error: Failed to create SSL structure\n");
+            ERR_print_errors_fp(stderr);
+            close(*new_socket); // Close the plain socket since we can't secure it
+            free(new_socket);
+            continue; // Skip to the next client
+        }
+        SSL_set_fd(ssl, *new_socket);
+
+        socket_wrapper_t *wrapper = malloc(sizeof(socket_wrapper_t));
+        if (!wrapper)
+        {
+            perror("malloc failed");
+            SSL_free(ssl);
+            close(*new_socket);
+            continue;
+        }
+        wrapper->fd = *new_socket;
+        wrapper->ssl = ssl;
+
+        if (pthread_create(&my_thread, NULL, thread_func, (void *)wrapper) != 0)
         {
             perror("Thread failure");
+            SSL_free(ssl);
             close(*new_socket);
             free(new_socket);
+            free(wrapper);
             continue;
         }
         fprintf(stdout, "received connection for socket : %d\n", *new_socket);
@@ -202,6 +341,7 @@ struct httpRequest *parse_methods(char *response)
                                                                       : (strncmp(request->uri, "/users/", 7) == 0) ? ((is_just_id(request->uri + 7)) ? URI_USERS_WITH_ID : URI_UNKNOWN)
                                                                       : (strcmp(request->uri, "/register") == 0)   ? URI_FOR_REGISTRATION
                                                                       : strcmp(request->uri, "/login") == 0        ? URI_FOR_LOGIN
+                                                                      : strcmp(request->uri, "/chat") == 0         ? URI_FOR_CHAT
                                                                                                                    : URI_UNKNOWN;
     request->enum_of_method = strcmp(method_string, "GET") == 0 ? GET : (strcmp(method_string, "POST") == 0) ? POST
                                                                     : strcmp(method_string, "PUT") == 0      ? PUT
@@ -222,14 +362,16 @@ struct httpRequest *parse_methods(char *response)
     }
     return request;
 }
-void get_func(socket_t fd, struct httpRequest *Request)
+void get_func(socket_t fd, SSL *ssl, struct httpRequest *Request)
 {
     if (strcmp(Request->uri, "/login") == 0)
-        serve_file(fd, "public/login.html");
+        serve_file(fd, ssl, "public/login.html");
     else if (strcmp(Request->uri, "/register") == 0)
-        serve_file(fd, "public/register.html");
+        serve_file(fd, ssl, "public/register.html");
     else if (strcmp(Request->uri, "/profile") == 0)
-        serve_file(fd, "public/profile.html");
+        serve_file(fd, ssl, "public/profile.html");
+    else if (strcmp(Request->uri, "/chat") == 0)
+        serve_file(fd, ssl, "public/chat.html");
     else
     {
         JSON_RESPONSE *json_body = (JSON_RESPONSE *)handle_get_uri(Request, Request->enum_for_uri);
@@ -239,12 +381,12 @@ void get_func(socket_t fd, struct httpRequest *Request)
             json_body->json_string = strdup("{\"message\":\"json is not having anything..endpoint entered might be wrong..\"}");
             json_body->Status = INTERNAL_SERVER_ERROR;
         }
-        send_response_back(fd, json_body);
+        send_response_back(fd, ssl, json_body);
         close(fd);
         clean_things(json_body->json_string, json_body, NULL);
     }
 }
-void patch_func(socket_t fd, struct httpRequest *Request)
+void patch_func(socket_t fd, SSL *ssl, struct httpRequest *Request)
 {
     JSON_RESPONSE *json_response = NULL;
     json_response = handle_patch_uri(Request->uri, Request->header_info->body);
@@ -254,7 +396,7 @@ void patch_func(socket_t fd, struct httpRequest *Request)
         json_response->json_string = strdup("\"Message\":\"Nothing received from the server\"");
         json_response->Status = NOT_FOUND;
     }
-    send_response_back(fd, json_response);
+    send_response_back(fd, ssl, json_response);
     close(fd);
     clean_things(json_response->json_string, json_response, NULL);
 }
@@ -332,7 +474,7 @@ char *get_header(char *buff)
     return NULL;
 }
 
-void post_func(socket_t client_fd, struct httpRequest *post_request)
+void post_func(socket_t client_fd, SSL *ssl, struct httpRequest *post_request)
 {
     JSON_RESPONSE *json_response = NULL;
     if (strcmp(post_request->header_info->content_type, "application/json") == 0)
@@ -366,11 +508,11 @@ void post_func(socket_t client_fd, struct httpRequest *post_request)
         json_response->Status = INTERNAL_SERVER_ERROR;
     }
     // Format HTTP response (just like get_func does)
-    send_response_back(client_fd, json_response);
+    send_response_back(client_fd, ssl, json_response);
     close(client_fd);                                              // Close the connection
     clean_things(json_response->json_string, json_response, NULL); // Free the allocated JSON string
 }
-void put_func(socket_t fd, struct httpRequest *Request)
+void put_func(socket_t fd, SSL *ssl, struct httpRequest *Request)
 {
     JSON_RESPONSE *json = NULL;
     if (strncmp(Request->uri, "/me", 3) == 0)
@@ -390,12 +532,12 @@ void put_func(socket_t fd, struct httpRequest *Request)
             json->Status = BAD_REQUEST;
         }
     }
-    send_response_back(fd, json);
+    send_response_back(fd, ssl, json);
     close(fd);
     clean_things(json->json_string, json, NULL);
 }
 
-void delete_func(socket_t fd, struct httpRequest *Request)
+void delete_func(socket_t fd, SSL *ssl, struct httpRequest *Request)
 {
     JSON_RESPONSE *json_response = NULL;
     if (strncmp(Request->uri, "/users/", 7) == 0 && is_just_id(Request->uri + 7))
@@ -416,7 +558,7 @@ void delete_func(socket_t fd, struct httpRequest *Request)
             return;
         }
     }
-    send_response_back(fd, json_response);
+    send_response_back(fd, ssl, json_response);
     close(fd);
     clean_things(json_response->json_string, json_response, NULL);
 }
@@ -526,7 +668,7 @@ jwt_t *get_decoded_token(char *token)
     size_t sec_len = strlen(secret);
     return (!jwt_decode(&my_jwt, (const char *)token, (const unsigned char *)secret, (int)sec_len)) ? my_jwt : NULL;
 }
-void serve_file(socket_t fd, const char *path)
+void serve_file(socket_t fd, SSL *ssl, const char *path)
 {
     int file_fd = open(path, O_RDONLY);
     if (file_fd < 0)
@@ -541,13 +683,119 @@ void serve_file(socket_t fd, const char *path)
                                      "Content-Length: %ld\r\n"
                                      "Content-Type: text/html\r\n\r\n",
                              file_size);
-    write(fd, header, header_len);
+    SSL_write(ssl, header, header_len);
 
-    off_t offset = 0;
-    ssize_t send_bytes = sendfile(fd, file_fd, &offset, file_size);
-    if (send_bytes < 0)
+    // Read file in chunks and send via SSL
+    char file_buffer[4096];
+    ssize_t bytes_read;
+    while ((bytes_read = read(file_fd, file_buffer, sizeof(file_buffer))) > 0)
     {
-        perror("sendfile failed");
+        SSL_write(ssl, file_buffer, bytes_read); // ← CHANGED from sendfile()
     }
-    close(fd);
+
+    close(file_fd);
+}
+
+void add_client_for_websock(socket_t fd, int id, SSL *ssl)
+{
+    Client *new_client = (Client *)malloc(sizeof(Client));
+    if (!new_client)
+    {
+        fprintf(stderr, "memory allocation failed for Client structure...");
+        return;
+    }
+    new_client->client_id = id;
+    new_client->fd = fd;
+    new_client->ssl = ssl;
+    new_client->next = NULL;
+    pthread_mutex_lock(&client_mutex);
+    if (clients == NULL)
+    {
+        clients = new_client;
+    }
+    else
+    {
+        Client *temp = clients;
+        while (temp->next != NULL)
+        {
+            temp = temp->next;
+        }
+        temp->next = new_client;
+    }
+    pthread_mutex_unlock(&client_mutex);
+}
+
+void remove_client_for_websock(socket_t fd)
+{
+    pthread_mutex_lock(&client_mutex);
+    Client *curr = clients, *prev = NULL;
+    while (curr != NULL)
+    {
+        if (curr->fd == fd)
+        {
+            if (prev == NULL)
+                clients = curr->next;
+            else
+                prev->next = curr->next;
+            if (curr->ssl)
+            {
+                SSL_shutdown(curr->ssl);
+                SSL_free(curr->ssl);
+            }
+            free(curr);
+            break;
+        }
+        prev = curr;
+        curr->next = prev->next;
+    }
+    pthread_mutex_unlock(&client_mutex);
+}
+void init_openssl()
+{
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+}
+
+void cleanup_openssl()
+{
+    EVP_cleanup();
+}
+
+SSL_CTX *create_ssl_context()
+{
+    const SSL_METHOD *method;
+    SSL_CTX *ctx;
+
+    method = TLS_server_method(); // Use TLS 1.2+
+    ctx = SSL_CTX_new(method);
+    if (!ctx)
+    {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    return ctx;
+}
+
+void configure_ssl_context(SSL_CTX *ctx)
+{
+    // Load certificate and private key
+    if (SSL_CTX_use_certificate_file(ctx, "src/certs/cert.pem", SSL_FILETYPE_PEM) <= 0)
+    {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ctx, "src/certs/key.pem", SSL_FILETYPE_PEM) <= 0)
+    {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    // Verify private key
+    if (!SSL_CTX_check_private_key(ctx))
+    {
+        fprintf(stderr, "Private key does not match the certificate\n");
+        exit(EXIT_FAILURE);
+    }
 }

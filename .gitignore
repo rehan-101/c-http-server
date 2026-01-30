@@ -11,3 +11,7 @@ myServer
 
 # OS
 .DS_Store
+
+#certs
+src/certs/key.pem
+src/certs/cert.pem

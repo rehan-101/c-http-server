@@ -3,6 +3,7 @@
 
 #include <cjson/cJSON.h>
 #include <sqlite3.h>
+#include <openssl/ssl.h>
 typedef int socket_t;
 extern sqlite3 *db;
 
@@ -37,6 +38,6 @@ JSON_RESPONSE *handle_update_current_user(const char*body);
 JSON_RESPONSE *handle_delete_with_id(int id);
 JSON_RESPONSE *handle_patch_with_id(int id, const char *body);
 void print_all_the_users();
-void send_response_back(socket_t fd, JSON_RESPONSE *json);
-void send_json(socket_t fd, int status, const char *status_text, const char *json);
+void send_response_back(socket_t fd, SSL *ssl,JSON_RESPONSE *json);
+void send_json(socket_t fd,SSL *ssl, int status, const char *status_text, const char *json);
 #endif

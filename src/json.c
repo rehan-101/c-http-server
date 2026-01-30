@@ -9,38 +9,37 @@
 #include <unistd.h>
 #include <jwt.h>
 int number_of_users = 0;
-void send_response_back(socket_t fd, JSON_RESPONSE *json)
+void send_response_back(socket_t fd, SSL *ssl, JSON_RESPONSE *json) // ← ADDED SSL parameter
 {
     switch (json->Status)
     {
     case OK:
-        send_json(fd, 200, "OK", json->json_string);
+        send_json(fd, ssl, 200, "OK", json->json_string); // ← ADDED ssl
         break;
     case CREATED:
-        send_json(fd, 201, "CREATED", json->json_string);
+        send_json(fd, ssl, 201, "CREATED", json->json_string); // ← ADDED ssl
         break;
     case NO_CONTENT:
-        send_json(fd, 204, "No content", json->json_string);
+        send_json(fd, ssl, 204, "No content", json->json_string); // ← ADDED ssl
         break;
     case NOT_FOUND:
-        send_json(fd, 404, "Not Found", json->json_string);
+        send_json(fd, ssl, 404, "Not Found", json->json_string); // ← ADDED ssl
         break;
     case BAD_REQUEST:
-        send_json(fd, 400, "Bad Request", json->json_string);
+        send_json(fd, ssl, 400, "Bad Request", json->json_string); // ← ADDED ssl
         break;
     case UNAUTHORIZED:
-        send_json(fd, 401, "Unauthorized", json->json_string);
+        send_json(fd, ssl, 401, "Unauthorized", json->json_string); // ← ADDED ssl
         break;
     case CONFLICT:
-        send_json(fd, 409, "CONFLICT", json->json_string);
+        send_json(fd, ssl, 409, "CONFLICT", json->json_string); // ← ADDED ssl
         break;
     case INTERNAL_SERVER_ERROR:
-        send_json(fd, 500, "server error", json->json_string);
+        send_json(fd, ssl, 500, "server error", json->json_string); // ← ADDED ssl
         break;
     }
 }
-
-void send_json(socket_t fd, int status, const char *status_text, const char *json)
+void send_json(socket_t fd, SSL *ssl, int status, const char *status_text, const char *json)
 {
     char buffer[4096];
     int body_len = strlen(json);
@@ -54,9 +53,11 @@ void send_json(socket_t fd, int status, const char *status_text, const char *jso
         "\r\n"
         "%s",
         status, status_text, body_len, json);
-    if (write(fd, buffer, len) < 0)
+
+    if (SSL_write(ssl, buffer, len) < 0)
     {
-        perror("write");
+        perror("SSL_write");
+        ERR_print_errors_fp(stderr);
         return;
     }
 }
@@ -728,10 +729,10 @@ JSON_RESPONSE *handle_update_current_user(const char *body)
             name, username, email, "password"};
         for (int i = 1; i < 5; i++)
         {
-            if (strcmp(fields[i-1], "password") == 0)
+            if (strcmp(fields[i - 1], "password") == 0)
                 result = sqlite3_bind_blob(statement, i, new_hashed_password, -1, SQLITE_STATIC);
             else
-                result = (sqlite3_bind_text(statement, i, fields[i-1], -1, SQLITE_STATIC));
+                result = (sqlite3_bind_text(statement, i, fields[i - 1], -1, SQLITE_STATIC));
             if (result != SQLITE_OK)
             {
                 cJSON_Delete(data);

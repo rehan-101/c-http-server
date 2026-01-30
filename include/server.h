@@ -6,11 +6,14 @@
 #include <sqlite3.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include "json.h"
 extern sqlite3 *db;
 typedef int socket_t;
 #define BUFFER_SIZE 16000
 struct Server;
+extern SSL_CTX *global_ssl_ctx;
 typedef void (*launch)(struct Server *);
 void clean_things(void *, ...);
 
@@ -27,6 +30,7 @@ struct Server
     socket_t socket_fd;
     struct sockaddr_in address;
     launch Launch_function;
+    SSL_CTX *ssl_ctx;
 };
 typedef enum Methods
 {
@@ -50,12 +54,13 @@ typedef enum
     URI_FOR_REGISTRATION,
     URI_FOR_LOGIN,
     URI_FOR_PROFILE,
+    URI_FOR_CHAT,
 } uri_t;
 typedef struct
 {
     Methods method;
     uri_t enum_for_uri[10];
-    void (*handler)(socket_t file_descriptor, struct httpRequest *Request);
+    void (*handler)(socket_t file_descriptor, SSL *ssl, struct httpRequest *Request);
 } Route;
 struct info_after_method_line
 {
@@ -69,13 +74,30 @@ struct httpRequest
     uri_t enum_for_uri;
     struct info_after_method_line *header_info;
 };
+
+typedef struct client
+{
+    socket_t fd;
+    int client_id;
+    SSL *ssl;
+    struct client *next;
+} Client;
+
+typedef struct
+{
+    int fd;
+    SSL *ssl;
+} socket_wrapper_t;
+
+extern Client *clients;
+extern pthread_mutex_t client_mutex;
 struct Server
 server_constructor(int domain, int port, int service, int protocol, int backlog, u_long interface);
-void get_func(socket_t, struct httpRequest *);
-void post_func(socket_t client_fd, struct httpRequest *);
-void put_func(socket_t client_fd, struct httpRequest *);
-void delete_func(socket_t fd, struct httpRequest *);
-void patch_func(socket_t fd, struct httpRequest *);
+void get_func(socket_t, SSL *ssl, struct httpRequest *);
+void post_func(socket_t client_fd, SSL *ssl, struct httpRequest *);
+void put_func(socket_t client_fd, SSL *ssl, struct httpRequest *);
+void delete_func(socket_t fd, SSL *ssl, struct httpRequest *);
+void patch_func(socket_t fd, SSL *ssl, struct httpRequest *);
 struct httpRequest *parse_methods(char *response);
 JSON_RESPONSE *handle_get_uri(struct httpRequest *Request, uri_t uri_enum);
 JSON_RESPONSE *handle_patch_uri(const char *uri, const char *body);
@@ -87,8 +109,17 @@ char *get_header(char *buffer);
 int is_just_id(const char *uri);
 int make_hashed_password(char *original_pass, char *hashed_pass, const char *salt);
 
-void serve_file(socket_t fd, const char *filepath);
+void serve_file(socket_t fd, SSL *ssl, const char *filepath);
 int is_expired(jwt_t *my_jwt, const char *exp);
 char *get_token(const char *body);
 jwt_t *get_decoded_token(char *token);
+
+/*supporting functions for https secured layer*/
+SSL_CTX *create_ssl_context();
+void configure_ssl_context(SSL_CTX *ctx);
+void init_openssl();
+void cleanup_openssl();
+
+void add_client_for_websock(socket_t fd, int id, SSL *ssl);
+void remove_client_for_websock(socket_t fd);
 #endif

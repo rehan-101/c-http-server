@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -g -fsanitize=address
-LDFLAGS = -lcjson -lsqlite3 -lcrypto -ljwt -pthread
+LDFLAGS = -lcjson -lsqlite3 -lssl -lcrypto -ljwt -pthread
 
 SRC_DIR = src
 INC_DIR = include
