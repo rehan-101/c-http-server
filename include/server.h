@@ -9,6 +9,12 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "json.h"
+#include "config.h"
+#include "logger.h"
+#include "timeout.h"
+#include "conn_limits.h"
+#include "signals.h"
+
 extern sqlite3 *db;
 typedef int socket_t;
 #define BUFFER_SIZE 16000
@@ -21,7 +27,8 @@ void clean_things(void *, ...);
 #define SALT_LEN 16
 #define HASH_LEN 32
 
-extern const char *headers_request; // global pointer for collecting the headers of the request
+extern const char *headers_request;       // global pointer for collecting the headers of the request
+extern ConnLimitsTracker *g_conn_tracker; // Global connection limits tracker
 
 struct Server
 {
@@ -89,6 +96,46 @@ typedef struct
     SSL *ssl;
 } socket_wrapper_t;
 
+/* Epoll specific additions */
+// state machine : tracks where each connection is in its lifecycle
+typedef enum
+{
+    CONN_STATE_SSL_HANDSHAKE,   // performing SSL/TLS handshake
+    CONN_STATE_READING_REQUEST, // Reading HTTP/Websockets request
+    CONN_STATE_WEBSOCKET,       // active websockets connection
+    CONN_STATE_CLOSING,         // Connection being closed
+} conn_state_t;
+
+// Epoll client structure (replaces thread stack for tracking state)
+typedef struct epoll_client
+{
+    socket_t fd;
+    SSL *ssl;           // SSL connection
+    conn_state_t state; // current state of the connected client
+
+    int is_websocket; // 1 if upgraded to websocket
+    int client_id;    // websocket client id
+
+    char buffer[BUFFER_SIZE]; // Request buffer
+    size_t buffer_used;       // bytes in buffer
+    // SSL state
+    int want_ssl_read;
+    int want_ssl_write;
+
+    // Timeout tracking - prevents slow clients from holding resources
+    TimeoutTracker timeout;
+
+    // Client IP address - for connection limits enforcement
+    uint32_t client_ip; // IP in network byte order (for conn_limits)
+
+    // Linked list
+    struct epoll_client *next;
+} epoll_client_t;
+
+// Epoll configuration
+#define MAX_EPOLL_EVENTS 1024
+#define EPOLL_TIMEOUT_MS 1000
+
 extern Client *clients;
 extern pthread_mutex_t client_mutex;
 struct Server
@@ -122,4 +169,14 @@ void cleanup_openssl();
 
 void add_client_for_websock(socket_t fd, int id, SSL *ssl);
 void remove_client_for_websock(socket_t fd);
+
+/* ====== EPOLL Functions declarations ====== */
+void listening_to_client_epoll(socket_t server_fd, SSL_CTX *ssl_ctx);
+
+// helper functions
+int set_nonblocking(int fd);
+epoll_client_t *create_epoll_client(socket_t fd, SSL *ssl,uint32_t client_ip);
+void free_epoll_client(epoll_client_t *client);
+epoll_client_t *find_epoll_client(socket_t fd);
+void remove_epoll_client(socket_t fd);
 #endif

@@ -13,9 +13,18 @@
 #include <sys/sendfile.h>
 #include <sqlite3.h>
 #include <pthread.h>
+#include <sys/epoll.h>
+#include <errno.h>
 
 Client *clients = NULL;
 pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* === Epoll global state === */
+static int epoll_fd = -1;
+static epoll_client_t *epoll_clients_head = NULL;
+static int ws_client_counter = 1;
+/* === End Epoll globals === */
+
 Route routes[] = {
     {.method = GET, .enum_for_uri = {ROOT_URI, URI_USER_INFO, URI_USERS, URI_USERS_WITH_ID, URI_FOR_LOGIN, URI_FOR_REGISTRATION, URI_FOR_PROFILE, URI_FOR_CHAT, 0}, .handler = get_func},
     {.method = POST, .enum_for_uri = {URI_USERS, URI_FOR_REGISTRATION, URI_FOR_LOGIN, 0}, .handler = post_func},
@@ -72,6 +81,884 @@ struct Server server_constructor(int domain, int port, int service, int protocol
     return server_obj;
 }
 
+/* ============================================================
+ *                   EPOLL HELPER FUNCTIONS
+ * ============================================================ */
+
+/**
+ * set_nonblocking - Make a file descriptor non-blocking
+ *
+ * This is CRITICAL for epoll. Without non-blocking I/O, a single
+ * slow read() would freeze the entire event loop, blocking ALL clients.
+ *
+ * How it works:
+ * 1. Get current file flags with F_GETFL
+ * 2. Add O_NONBLOCK flag
+ * 3. Set new flags with F_SETFL
+ *
+ * After this, read/write/accept return immediately even if not ready.
+ * If no data: returns -1 with errno = EAGAIN or EWOULDBLOCK
+ */
+
+int set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1)
+    {
+        perror("fcntl F_GETFL");
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
+    {
+        perror("fcntl F_SETFL O_NONBLOCK");
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * create_epoll_client - Allocate and initialize epoll client structure
+ *
+ * Why we need this:
+ * In threading, the thread stack stores all state (local variables, position in code).
+ * With epoll, we have ONE function handling ALL clients.
+ * This structure replaces the thread stack - stores per-client state.
+ *
+ * Stores:
+ * - Which state the connection is in (SSL handshake? Reading? WebSocket?)
+ * - Partial data buffer (for incremental reads)
+ * - SSL state (wants read? wants write?)
+ */
+
+epoll_client_t *create_epoll_client(socket_t fd, SSL *ssl, uint32_t client_ip)
+{
+    epoll_client_t *client = calloc(1, sizeof(epoll_client_t));
+    if (!client)
+    {
+        perror("Failed to allocate client structure");
+        return NULL;
+    }
+
+    client->fd = fd;
+    client->ssl = ssl;
+    client->state = CONN_STATE_SSL_HANDSHAKE; // all connections start with the handshake
+    client->is_websocket = 0;
+    client->client_id = 0;
+    client->buffer_used = 0;
+    client->want_ssl_read = 0;
+    client->want_ssl_write = 0;
+
+    /* Store client ip for connection limits */
+    client->client_ip = client_ip;
+
+    /* Initialize timeout tracker */
+    timeout_tracker_init(&client->timeout);
+
+    LOG_DEBUG("Created client fd=%d from IP=0x%08x with timeout tracking", fd, client_ip);
+    client->next = epoll_clients_head;
+    epoll_clients_head = client;
+
+    return client;
+}
+
+/**
+ * find_epoll_client - Find client by file descriptor
+ *
+ * When epoll_wait() returns "fd 42 is ready", we need to find
+ * the client structure to know:
+ * - What state is this connection in?
+ * - Where's the SSL context?
+ * - Where's the buffer?
+ *
+ * Simple O(n) linear search. Fine for <10K connections.
+ * For millions, use hash table.
+ */
+
+epoll_client_t *find_epoll_client(socket_t fd)
+{
+    epoll_client_t *current = epoll_clients_head;
+    while (current)
+    {
+        if (current->fd == fd)
+            return current;
+        current = current->next;
+    }
+    return NULL;
+}
+
+/**
+ * remove_epoll_client - Remove client from list and free resources
+ *
+ * Unlike threading where thread exit automatically frees stack,
+ * we must manually clean up client structures.
+ *
+ * Steps:
+ * 1. Find client in linked list
+ * 2. Remove from list
+ * 3. Shutdown SSL
+ * 4. Remove from epoll
+ * 5. Close socket
+ * 6. Free memory
+ */
+
+void remove_epoll_client(socket_t fd)
+{
+    epoll_client_t **current = &epoll_clients_head;
+    while (*current)
+    {
+        if ((*current)->fd == fd)
+        {
+            epoll_client_t *to_free = *current;
+            *current = (*current)->next;
+
+            // Remove from connection limits tracker
+            if (g_conn_tracker && to_free->client_ip)
+            {
+                conn_limits_remove(g_conn_tracker, to_free->client_ip);
+            }
+            // cleanup resouces
+            if (to_free->ssl)
+            {
+                SSL_shutdown(to_free->ssl);
+                SSL_free(to_free->ssl);
+            }
+            if (to_free->fd >= 0)
+            {
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, to_free->fd, NULL);
+                close(to_free->fd);
+            }
+            LOG_INFO("Removed client fd=%d", fd);
+            free(to_free);
+            return;
+        }
+        current = &(*current)->next;
+    }
+}
+
+/**
+ * free_epoll_client - Free client directly without list traversal
+ */
+void free_epoll_client(epoll_client_t *client)
+{
+    if (!client)
+        return;
+
+    if (client->ssl)
+    {
+        SSL_shutdown(client->ssl);
+        SSL_free(client->ssl);
+    }
+    if (client->fd >= 0)
+    {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+        close(client->fd);
+    }
+
+    free(client);
+}
+
+/* ============================================================
+ *                   EPOLL STATE HANDLERS
+ * ============================================================ */
+
+/**
+ * handle_ssl_handshake - Perform non-blocking SSL handshake
+ *
+ * SSL handshake is complex with non-blocking I/O because:
+ * - Requires multiple round-trips (ClientHello, ServerHello, etc.)
+ * - Might need to READ before writing
+ * - Might need to WRITE before reading
+ *
+ * Returns:
+ *   0 = In progress (try again later)
+ *  -1 = Fatal error (close connection)
+ */
+
+static int handle_ssl_handshake(epoll_client_t *client)
+{
+
+    // Check SSL handshake timeout
+    if (timeout_tracker_is_expired(&client->timeout,
+                                   g_config.ssl_handshake_timeout_sec,
+                                   g_config.request_timeout_sec,
+                                   g_config.connection_timeout_sec,
+                                   g_config.keepalive_timeout_sec))
+    {
+        LOG_WARN("SSL handshake timeout for fd=%d", client->fd);
+        return -1;
+    }
+
+    int ret = SSL_accept(client->ssl);
+
+    if (ret == 1)
+    {
+        // Success ! Handshake is completed
+        client->state = CONN_STATE_READING_REQUEST;
+        client->want_ssl_read = 0;
+        client->want_ssl_write = 0;
+
+        // Mark SSL handshake complete
+        timeout_tracker_ssl_complete(&client->timeout);
+        LOG_INFO("SSL handshake success for fd=%d", client->fd);
+
+        // Make sure you are monitoring for reads
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = client->fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+        return 0;
+    }
+    // Not completed yet : check why
+    int err = SSL_get_error(client->ssl, ret);
+    if (err == SSL_ERROR_WANT_READ)
+    {
+        // SSL needs more data to read
+        client->want_ssl_read = 1;
+        client->want_ssl_write = 0;
+
+        // Ensure monitoring for EPOLLIN
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = client->fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+        return 0;
+    }
+    else if (err == SSL_ERROR_WANT_WRITE)
+    {
+        // SSL needs data to write before reading (handshake renegotiation)
+        client->want_ssl_read = 0;
+        client->want_ssl_write = 1;
+
+        // switch to monitoring EPOLLOUT
+        struct epoll_event ev;
+        ev.events = EPOLLOUT | EPOLLET;
+        ev.data.fd = client->fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+        return 0;
+    }
+    else
+    {
+        ERR_print_errors_fp(stderr);
+        LOG_ERROR("SSL handshake FAILED for fd=%d", client->fd);
+        return -1;
+    }
+}
+
+/**
+ * handle_client_read - Read HTTP/WebSocket request
+ *
+ * Edge-triggered epoll requirement: MUST read ALL available data.
+ *
+ * Why buffering:
+ * Data might arrive in chunks:
+ *   Event 1: "GET /use"
+ *   Event 2: "rs HTTP/1"
+ *   Event 3: ".1\r\n\r\n"
+ *
+ * We buffer partial data until we have a complete request.
+ *
+ * Returns:
+ *   1 = Complete request received
+ *   0 = Incomplete, need more data
+ *  -1 = Error or connection closed
+ */
+
+static int handle_client_read(epoll_client_t *client)
+{
+    // Read in loop until EAGAIN
+    while (1)
+    {
+        size_t available = BUFFER_SIZE - client->buffer_used - 1;
+        if (available == 0)
+        {
+            LOG_ERROR("Buffer full for fd=%d", client->fd);
+            return -1;
+        }
+        int bytes = SSL_read(client->ssl, client->buffer + client->buffer_used, available);
+        if (bytes > 0)
+        {
+            // Got data
+            client->buffer_used += bytes;
+            client->buffer[client->buffer_used] = '\0';
+
+            // Update timeout tracker
+            timeout_tracker_activity(&client->timeout);
+
+            LOG_DEBUG("Read %d bytes from fd=%d (total: %zu)\n", bytes, client->fd, client->buffer_used);
+            // check for complete HTTP request (ends with \r\n\r\n)
+            if (strstr(client->buffer, "\r\n\r\n"))
+            {
+                LOG_INFO("Complete request received from fd = %d", client->fd);
+                timeout_tracker_request_complete(&client->timeout);
+                return 1;
+            }
+            continue; // might have more data
+        }
+        // bytes <= 0
+        int err = SSL_get_error(client->ssl, bytes);
+        if (err == SSL_ERROR_WANT_READ)
+        {
+            // No more data right now - normal with non-blocking
+            return 0;
+        }
+        else if (err == SSL_ERROR_WANT_WRITE)
+        {
+            client->state = CONN_STATE_SSL_HANDSHAKE;
+            // SSL needs to write before reading
+            struct epoll_event ev;
+            ev.events = EPOLLOUT | EPOLLET;
+            ev.data.fd = client->fd;
+            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+            return 0;
+        }
+        else if (err == SSL_ERROR_ZERO_RETURN)
+        {
+            // clean shutdown
+            LOG_INFO("Client fd=%d closed cleanly", client->fd);
+            return -1;
+        }
+        else
+        {
+            if (bytes == 0)
+                LOG_INFO(" Client fd = %d disconnected\n", client->fd);
+            else
+                ERR_print_errors_fp(stderr);
+            return -1;
+        }
+    }
+}
+
+/**
+ * process_http_request - Parse and route HTTP request
+ *
+ * This is simpler than threading! We just:
+ * 1. Check if WebSocket upgrade
+ * 2. Parse HTTP request
+ * 3. Call existing handlers (UNCHANGED from threading!)
+ * 4. Close connection or upgrade to WebSocket
+ *
+ * The beauty: All your existing get_func, post_func, etc. work as-is!
+ */
+
+static void process_http_request(epoll_client_t *client)
+{
+    // Check for web socket upgrade
+    if (strstr(client->buffer, "Upgrade: websocket") != NULL)
+    {
+        LOG_INFO("Websocket upgrade request on fd = %d\n", client->fd);
+        if (ws_handshake(client->fd, client->ssl, client->buffer) < 0)
+        {
+            LOG_ERROR("Websocket handshake failed\n");
+            remove_epoll_client(client->fd);
+            return;
+        }
+        // Upgrade Successful
+        client->is_websocket = 1;
+        client->client_id = ws_client_counter++;
+        client->state = CONN_STATE_WEBSOCKET;
+        client->buffer_used = 0;
+
+        LOG_INFO("Client fd=%d upgraded to websocket", client->fd);
+        // Send welcome
+        char welcome[256];
+        snprintf(welcome, sizeof(welcome),
+                 "{\"type\":\"system\",\"message\":\"Welcome! You are client #%d\"}",
+                 client->client_id);
+        ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT,
+                      welcome, strlen(welcome));
+        return;
+    }
+
+    // Regular HTTPS request - parse it
+    struct httpRequest *request = parse_methods(client->buffer);
+    if (!request)
+    {
+        LOG_ERROR("Failed to parse HTTP request\n");
+        remove_epoll_client(client->fd);
+        return;
+    }
+    LOG_INFO(" HTTP %s %s from fd=%d\n",
+             request->enum_of_method == GET ? "GET" : request->enum_of_method == POST ? "POST"
+                                                  : request->enum_of_method == PUT    ? "PUT"
+                                                  : request->enum_of_method == DELETE ? "DELETE"
+                                                                                      : "PATCH",
+             request->uri, client->fd);
+
+    // Route to handler (SAME LOGIC as threading!)
+    int method_found = 0;
+    int route_matched = 0;
+
+    for (int i = 0; i < no_of_routes; i++)
+    {
+        if (routes[i].method == request->enum_of_method)
+        {
+            method_found = 1;
+            int j = 0;
+            while (routes[i].enum_for_uri[j] != 0)
+            {
+                if (routes[i].enum_for_uri[j] == request->enum_for_uri)
+                {
+                    route_matched = 1;
+                    routes[i].handler(client->fd, client->ssl, request);
+                    goto done;
+                }
+                j++;
+            }
+        }
+    }
+
+    if (method_found && !route_matched)
+    {
+        send_json(client->fd, client->ssl, 404, "Not Found",
+                  "{\"error\":\"Wrong endpoint for this method\"}");
+    }
+    else if (!method_found)
+    {
+        send_json(client->fd, client->ssl, 405, "Method Not Allowed",
+                  "{\"error\":\"Method not supported\"}");
+    }
+
+done:
+    clean_things(request->uri, request->header_info->body,
+                 request->header_info->content_type, request, NULL);
+
+    // HTTP complete - close connection
+    remove_epoll_client(client->fd);
+}
+
+/**
+ * handle_websocket_frame - Process WebSocket frames
+ *
+ * Threading: while(1) { read_frame(); } - blocks forever
+ * Epoll: Read available frames, return to event loop
+ *
+ * Returns:
+ *   0 = Success, keep connection
+ *  -1 = Close connection
+ */
+
+static int handle_websocket_frame(epoll_client_t *client)
+{
+    char ws_buffer[BUFFER_SIZE];
+
+    // Read all available frames (edge-triggered requirement)
+    while (1)
+    {
+        int bytes = SSL_read(client->ssl, ws_buffer, sizeof(ws_buffer) - 1);
+
+        if (bytes <= 0)
+        {
+            int err = SSL_get_error(client->ssl, bytes);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            {
+                return 0; // Normal - no more frames
+            }
+
+            LOG_INFO("WebSocket client #%d disconnected\n", client->client_id);
+            return -1;
+        }
+        ws_frame_t *frame = ws_parse_frame((uint8_t *)ws_buffer, bytes);
+        if (!frame)
+        {
+            LOG_ERROR("Failed to parse frame from client fd = %d\n", client->client_id);
+            continue;
+        }
+        // Handle frame types
+        switch (frame->opcode)
+        {
+        case WS_OPCODE_TEXT:
+            LOG_INFO("WebSocket client #%d: %s\n",
+                     client->client_id, frame->payload);
+
+            // Broadcast
+            cJSON *msg_obj = cJSON_CreateObject();
+            cJSON_AddNumberToObject(msg_obj, "sender_id", client->client_id);
+            cJSON_AddStringToObject(msg_obj, "type", "message");
+            cJSON_AddStringToObject(msg_obj, "message", frame->payload);
+            cJSON_AddNumberToObject(msg_obj, "timestamp", time(NULL));
+
+            char *json_str = cJSON_PrintUnformatted(msg_obj);
+
+            // Broadcast to all WebSocket clients
+            epoll_client_t *curr = epoll_clients_head;
+            while (curr)
+            {
+                if (curr->fd != client->fd && curr->is_websocket)
+                {
+                    ws_send_frame(curr->fd, curr->ssl, WS_OPCODE_TEXT,
+                                  json_str, strlen(json_str));
+                }
+                curr = curr->next;
+            }
+
+            free(json_str);
+            cJSON_Delete(msg_obj);
+            break;
+
+        case WS_OPCODE_PING:
+            ws_send_frame(client->fd, client->ssl, WS_OPCODE_PONG,
+                          frame->payload, frame->payload_len);
+            break;
+
+        case WS_OPCODE_CLOSE:
+            LOG_INFO("WebSocket client #%d requested close\n",
+                     client->client_id);
+            ws_send_frame(client->fd, client->ssl, WS_OPCODE_CLOSE, NULL, 0);
+            ws_free_frame(frame);
+            return -1;
+
+        default:
+            LOG_ERROR("Unknown opcode %d from client #%d\n",
+                      frame->opcode, client->client_id);
+        }
+
+        ws_free_frame(frame);
+    }
+    return 0;
+}
+
+/* ============================================================
+ *                   EPOLL MAIN FUNCTIONS
+ * ============================================================ */
+
+/**
+ * accept_new_connections - Accept all pending connections
+ *
+ * Why loop until EAGAIN:
+ * With edge-triggered epoll, we get ONE notification when state changes.
+ * Multiple clients might have connected. Accept ALL of them!
+ */
+
+static void accept_new_connections(socket_t server_fd, SSL_CTX *ssl_ctx)
+{
+    while (1)
+    {
+        struct sockaddr_in client_addr;
+        socklen_t addrlen = sizeof(client_addr);
+
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
+
+        if (client_fd < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                break; // All connections accepted
+            }
+            LOG_ERRNO(LOG_ERROR, "accept");
+            continue;
+        }
+
+        // check connection limits
+        if (g_conn_tracker && conn_limits_can_accept(g_conn_tracker, client_addr.sin_addr.s_addr) < 0)
+        {
+            struct in_addr addr = client_addr.sin_addr;
+            LOG_WARN("Connection limit exceeded for %s, rejecting",
+                     inet_ntoa(addr));
+            close(client_fd);
+            continue;
+        }
+
+        LOG_INFO("New connection: fd=%d from %s:%d\n",
+                 client_fd,
+                 inet_ntoa(client_addr.sin_addr),
+                 ntohs(client_addr.sin_port));
+
+        // Make non-blocking
+        if (set_nonblocking(client_fd) < 0)
+        {
+            close(client_fd);
+            continue;
+        }
+
+        // Create SSL
+        SSL *ssl = SSL_new(ssl_ctx);
+        if (!ssl)
+        {
+            LOG_ERROR("Failed to create SSL structure\n");
+            ERR_print_errors_fp(stderr);
+            close(client_fd);
+            continue;
+        }
+
+        SSL_set_fd(ssl, client_fd);
+
+        // Create client structure with ip and timeout initialized
+        epoll_client_t *client = create_epoll_client(client_fd, ssl, client_addr.sin_addr.s_addr);
+        if (!client)
+        {
+            SSL_free(ssl);
+            close(client_fd);
+            continue;
+        }
+        // Add to connection limits tracker
+        if (g_conn_tracker)
+        {
+            conn_limits_add(g_conn_tracker, client->client_ip);
+        }
+        // Add to epoll
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET; // Edge-triggered
+        ev.data.fd = client_fd;
+
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) < 0)
+        {
+            LOG_ERRNO(LOG_ERROR, "epoll_ctl: client_fd");
+            free_epoll_client(client);
+            continue;
+        }
+
+        LOG_INFO("Added client fd=%d to epoll\n", client_fd);
+    }
+}
+
+/**
+ * handle_client_event - Process event for existing client
+ *
+ * This is the STATE MACHINE heart!
+ * Based on current state, call appropriate handler.
+ */
+
+static void handle_client_event(int fd, uint32_t events)
+{
+    epoll_client_t *client = find_epoll_client(fd);
+    if (!client)
+    {
+        LOG_ERROR(" Client not found for fd=%d\n", fd);
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
+        return;
+    }
+    // Handle errors
+    if (events & (EPOLLERR | EPOLLHUP))
+    {
+        LOG_ERROR(" Error/hangup on fd=%d\n", fd);
+        remove_epoll_client(fd);
+        return;
+    }
+    // Process based on state
+    int result = 0;
+    switch (client->state)
+    {
+    case CONN_STATE_SSL_HANDSHAKE:
+        result = handle_ssl_handshake(client);
+        if (result < 0)
+        {
+            remove_epoll_client(fd);
+        }
+        break;
+    case CONN_STATE_READING_REQUEST:
+        result = handle_client_read(client);
+        if (result < 0)
+            remove_epoll_client(fd);
+        else if (result > 0)
+            // complete request!
+            process_http_request(client);
+        break;
+    case CONN_STATE_WEBSOCKET:
+        result = handle_websocket_frame(client);
+        if (result < 0)
+            remove_epoll_client(fd);
+        break;
+    case CONN_STATE_CLOSING:
+        remove_epoll_client(fd);
+        break;
+    default:
+        LOG_ERROR("Unknown state %d for fd=%d\n",
+                  client->state, fd);
+        remove_epoll_client(fd);
+    }
+}
+
+static void check_timeouts(void)
+{
+    epoll_client_t *current = epoll_clients_head;
+    epoll_client_t *next;
+
+    while (current)
+    {
+        next = current->next;
+
+        if (timeout_tracker_is_expired(&current->timeout,
+                                       g_config.ssl_handshake_timeout_sec,
+                                       g_config.request_timeout_sec,
+                                       g_config.connection_timeout_sec,
+                                       g_config.keepalive_timeout_sec))
+        {
+            const char *reason = timeout_tracker_reason(&current->timeout,
+                                                        g_config.ssl_handshake_timeout_sec,
+                                                        g_config.request_timeout_sec,
+                                                        g_config.connection_timeout_sec,
+                                                        g_config.keepalive_timeout_sec);
+
+            LOG_INFO("Connection fd=%d timed out: %s", current->fd, reason);
+            remove_epoll_client(current->fd);
+        }
+
+        current = next;
+    }
+}
+
+/**
+ * listening_to_client_epoll - Main epoll event loop
+ *
+ * One loop handles ALL connections. No threads!
+ *
+ * Flow:
+ * 1. Wait for events (epoll_wait blocks here)
+ * 2. Loop through ready FDs
+ * 3. If server socket: accept new connections
+ * 4. If client socket: handle based on state
+ * 5. Repeat forever
+ */
+
+void listening_to_client_epoll(socket_t server_fd, SSL_CTX *ssl)
+{
+    LOG_INFO("Entering epoll event loop on server_fd=%d", server_fd);
+
+    // Create epoll instance
+    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd < 0)
+    {
+        LOG_ERRNO(LOG_ERROR, "epoll_create1 failed");
+        return;
+    }
+    LOG_INFO("Created epoll instance: fd=%d\n", epoll_fd);
+    // Make server socket non blocking
+    if (set_nonblocking(server_fd) < 0)
+    {
+        LOG_ERRNO(LOG_ERROR, "Failed to set server socket non-blocking\n");
+        return;
+    }
+    LOG_INFO("Server socket set to non-blocking\n");
+
+    // Add server socket to epoll
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = server_fd;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0)
+    {
+        LOG_ERRNO(LOG_ERROR, "epoll_ctl add server_fd failed");
+        close(epoll_fd);
+        return;
+    }
+    LOG_DEBUG("Added server_fd=%d to epoll", server_fd);
+    // Main event loop
+    struct epoll_event events[MAX_EPOLL_EVENTS];
+    int timeout_counter = 0;
+    const int TIMEOUT_CHECK_INTERVAL = 10; // Check timeout every 10 iterations
+    while (!should_shutdown())             // Check shutdown flag from signals
+    {
+        // Wait for events - THIS IS THE ONLY BLOCKING POINT
+        int n_events = epoll_wait(epoll_fd, events, MAX_EPOLL_EVENTS, EPOLL_TIMEOUT_MS);
+
+        if (n_events < 0)
+        {
+            if (errno == EINTR)
+            {
+                if (should_shutdown())
+                {
+                    LOG_INFO("Shutting down server...");
+                    break;
+                }
+                else
+                    continue;
+            }
+            LOG_ERRNO(LOG_ERROR, "epoll_wait");
+            break;
+        }
+        if (n_events == 0)
+        {
+            timeout_counter++;
+            if (timeout_counter >= TIMEOUT_CHECK_INTERVAL)
+            {
+                check_timeouts();
+                timeout_counter = 0;
+                // Log connection stats periodically
+                if (g_conn_tracker)
+                {
+                    conn_limits_print_stats(g_conn_tracker);
+                }
+            }
+            // Check for config reload
+            if (should_reload())
+            {
+                LOG_INFO("Reloading configuration...");
+                config_load_from_file(&g_config, "server.conf");
+                config_load_from_env(&g_config);
+                clear_reload_flag();
+            }
+            continue;
+        } // Timeout - could do housekeeping here
+        LOG_DEBUG("epoll_wait returned %d events", n_events);
+        // Process each ready FD
+        for (int i = 0; i < n_events; i++)
+        {
+            int fd = events[i].data.fd;
+            uint32_t event_flags = events[i].events;
+
+            if (fd == server_fd)
+            {
+                // New connections!
+                LOG_INFO("Server socket ready - accepting...\n");
+                accept_new_connections(server_fd, ssl);
+            }
+            else
+            {
+                // Existing client
+                LOG_INFO("Client fd=%d ready (events: 0x%x)\n",
+                         fd, event_flags);
+                handle_client_event(fd, event_flags);
+            }
+        }
+    }
+    /* ========== GRACEFUL SHUTDOWN ========== */
+    LOG_INFO("Shutting down server gracefully...");
+
+    /* Close all client connections properly */
+    epoll_client_t *client = epoll_clients_head;
+    int client_count = 0;
+
+    while (client)
+    {
+        epoll_client_t *next = client->next;
+        client_count++;
+
+        LOG_INFO("Closing client fd=%d (state=%d)", client->fd, client->state);
+
+        /* Send WebSocket close frame if it's a WebSocket connection */
+        if (client->is_websocket && client->ssl)
+        {
+            ws_send_frame(client->fd, client->ssl, WS_OPCODE_CLOSE, NULL, 0);
+            LOG_DEBUG("Sent WebSocket CLOSE frame to fd=%d", client->fd);
+        }
+
+        /* Clean SSL shutdown */
+        if (client->ssl)
+        {
+            SSL_shutdown(client->ssl);
+            SSL_free(client->ssl);
+        }
+
+        /* Remove from epoll and close socket */
+        if (client->fd >= 0)
+        {
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+            close(client->fd);
+        }
+
+        /* Free client structure */
+        free(client);
+        client = next;
+    }
+    LOG_INFO("Closed %d client connections", client_count);
+
+    /* Close epoll file descriptor */
+    close(epoll_fd);
+
+    LOG_INFO("Server shutdown complete");
+}
+
 void *thread_func(void *arg)
 {
     socket_wrapper_t *wrapper = (socket_wrapper_t *)arg;
@@ -94,7 +981,7 @@ void *thread_func(void *arg)
         if (bytesRead < 0)
             fprintf(stderr, "error in reading bytes");
         SSL_shutdown(ssl);
-        SSL_free(ssl);
+SSL_free(ssl);
         close(new_socket);
         return NULL;
     }
@@ -301,19 +1188,19 @@ struct httpRequest *parse_methods(char *response)
     struct httpRequest *request = (struct httpRequest *)malloc(sizeof(struct httpRequest));
     if (request == NULL)
     {
-        perror("request may contain invalid format...");
+        LOG_ERRNO(LOG_ERROR, "request may contain invalid format...");
         exit(EXIT_FAILURE);
     }
     char *temp_response = strdup(response);
 
     if (!temp_response)
     {
-        fprintf(stderr, "Error in duplicating the response string...\n");
+        LOG_ERROR("Error in duplicating the response string...\n");
         free(request);
         return NULL;
     }
     char *first_line = strtok(temp_response, "\r\n");
-    printf("First Line is : %s\n", first_line);
+    LOG_INFO("First Line is : %s\n", first_line);
     char *token = NULL;
     token = strtok(first_line, " ");
     if (token != NULL)
@@ -322,7 +1209,7 @@ struct httpRequest *parse_methods(char *response)
     }
     else
     {
-        fprintf(stderr, "Error in tokenization of the the requested string...\n");
+        LOG_ERROR("Error in tokenization of the the requested string...\n");
         clean_things(temp_response, request, NULL);
         return NULL;
     }
@@ -331,7 +1218,7 @@ struct httpRequest *parse_methods(char *response)
         request->uri = strdup(token);
     else
     {
-        fprintf(stderr, "Error in tokenization\n");
+        LOG_ERROR("Error in tokenization\n");
         clean_things(method_string, temp_response, request, NULL);
         return NULL;
     }
@@ -404,7 +1291,7 @@ char *get_content_type(char *buff)
 {
     if (!buff)
     {
-        fprintf(stderr, "Buffer is empty..!\n");
+        LOG_ERROR("Buffer is empty..!\n");
         return NULL;
     }
     char *type = NULL;
@@ -429,7 +1316,7 @@ int get_content_len(char *buff)
 {
     if (!buff)
     {
-        fprintf(stderr, "Buffer is empty..!\n");
+        LOG_ERROR("Buffer is empty..!\n");
         return -1;
     }
     char *content = strstr(buff, "Content-Length:");
@@ -446,7 +1333,7 @@ char *get_body(char *buff)
 {
     if (!buff)
     {
-        fprintf(stderr, "Buffer is empty..!\n");
+        LOG_ERROR("Buffer is empty..!\n");
         return NULL;
     }
     char *body = strstr(buff, "\r\n\r\n");
@@ -554,7 +1441,7 @@ void delete_func(socket_t fd, SSL *ssl, struct httpRequest *Request)
         }
         else
         {
-            fprintf(stderr, "Allocation error in delete_func()");
+            LOG_ERROR("Allocation error in delete_func()");
             return;
         }
     }
@@ -701,7 +1588,7 @@ void add_client_for_websock(socket_t fd, int id, SSL *ssl)
     Client *new_client = (Client *)malloc(sizeof(Client));
     if (!new_client)
     {
-        fprintf(stderr, "memory allocation failed for Client structure...");
+        LOG_ERROR("memory allocation failed for Client structure...");
         return;
     }
     new_client->client_id = id;
@@ -770,7 +1657,7 @@ SSL_CTX *create_ssl_context()
     ctx = SSL_CTX_new(method);
     if (!ctx)
     {
-        perror("Unable to create SSL context");
+        LOG_FATAL("Unable to create SSL context");
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
@@ -795,7 +1682,7 @@ void configure_ssl_context(SSL_CTX *ctx)
     // Verify private key
     if (!SSL_CTX_check_private_key(ctx))
     {
-        fprintf(stderr, "Private key does not match the certificate\n");
+        LOG_FATAL("Private key does not match the certificate\n");
         exit(EXIT_FAILURE);
     }
 }

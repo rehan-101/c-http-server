@@ -15,3 +15,8 @@ myServer
 #certs
 src/certs/key.pem
 src/certs/cert.pem
+
+#log file
+server.log
+#config file
+server.conf
