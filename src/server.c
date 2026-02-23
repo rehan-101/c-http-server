@@ -2,6 +2,7 @@
 #include "../include/json.h"
 #include "../include/database.h"
 #include "../include/websocket.h"
+#include "../include/auth.h"
 #include <stdio.h>
 #include <jwt.h>
 #include <string.h>
@@ -10,7 +11,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/sendfile.h>
 #include <sqlite3.h>
 #include <pthread.h>
 #include <sys/epoll.h>
@@ -25,12 +25,23 @@ static epoll_client_t *epoll_clients_head = NULL;
 static int ws_client_counter = 1;
 /* === End Epoll globals === */
 
+// === Chat Application Global State ===
+static online_user_t *online_users_head = NULL;
+static pthread_mutex_t online_users_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static chat_message_history_t *message_history_head = NULL;
+static pthread_mutex_t history_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static typing_indicator_t *typing_indicators_head = NULL;
+static pthread_mutex_t typing_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Message history limit
+#define MAX_HISTORY_MESSAGES 100
+
 Route routes[] = {
-    {.method = GET, .enum_for_uri = {ROOT_URI, URI_USER_INFO, URI_USERS, URI_USERS_WITH_ID, URI_FOR_LOGIN, URI_FOR_REGISTRATION, URI_FOR_PROFILE, URI_FOR_CHAT, 0}, .handler = get_func},
-    {.method = POST, .enum_for_uri = {URI_USERS, URI_FOR_REGISTRATION, URI_FOR_LOGIN, 0}, .handler = post_func},
-    {.method = PUT, .enum_for_uri = {URI_USERS_WITH_ID, URI_USER_INFO, 0}, .handler = put_func},
-    {.method = DELETE, .enum_for_uri = {URI_USERS_WITH_ID, 0}, .handler = delete_func},
-    {.method = PATCH, .enum_for_uri = {URI_USERS_WITH_ID, 0}, .handler = patch_func},
+    {.method = GET, .enum_for_uri = {ROOT_URI, URI_USER_INFO, URI_FOR_LOGIN, URI_FOR_REGISTRATION, URI_FOR_PROFILE, URI_FOR_CHAT, 0}, .handler = get_func},
+    {.method = POST, .enum_for_uri = {URI_FOR_REGISTRATION, URI_FOR_LOGIN, 0}, .handler = post_func},
+    {.method = PUT, .enum_for_uri = {URI_USER_INFO, 0}, .handler = put_func},
 };
 int no_of_routes = sizeof(routes) / sizeof(routes[0]);
 const char *headers_request = NULL; // global pointer for collecting the headers of the request
@@ -148,6 +159,7 @@ epoll_client_t *create_epoll_client(socket_t fd, SSL *ssl, uint32_t client_ip)
     client->want_ssl_read = 0;
     client->want_ssl_write = 0;
 
+    client->username[0] = '\0'; // Initialize username as empty
     /* Store client ip for connection limits */
     client->client_ip = client_ip;
 
@@ -187,6 +199,25 @@ epoll_client_t *find_epoll_client(socket_t fd)
 }
 
 /**
+ * find_client_by_username - Find WebSocket client by username
+ *
+ * When sending a private message, we need to find the actual client
+ * structure to send the message to. This searches through all connected
+ * WebSocket clients.
+ */
+epoll_client_t *find_client_by_username(const char *username)
+{
+    epoll_client_t *current = epoll_clients_head;
+    while (current)
+    {
+        if (current->is_websocket && current->username[0] != '\0' && strcmp(current->username, username) == 0)
+            return current;
+        current = current->next;
+    }
+    return NULL;
+}
+
+/**
  * remove_epoll_client - Remove client from list and free resources
  *
  * Unlike threading where thread exit automatically frees stack,
@@ -216,6 +247,15 @@ void remove_epoll_client(socket_t fd)
             {
                 conn_limits_remove(g_conn_tracker, to_free->client_ip);
             }
+
+            // Clean up chat resources
+            if (to_free->username[0] != '\0')
+            {
+                remove_online_user(fd);
+                broadcast_leave_message(to_free->username);
+                broadcast_user_list();
+            }
+
             // cleanup resouces
             if (to_free->ssl)
             {
@@ -446,6 +486,36 @@ static void process_http_request(epoll_client_t *client)
     if (strstr(client->buffer, "Upgrade: websocket") != NULL)
     {
         LOG_INFO("Websocket upgrade request on fd = %d\n", client->fd);
+
+        // *** NEW: Validate WebSocket authentication ***
+        auth_context_t auth_ctx;
+        if (auth_validate_websocket_token(client->buffer, &auth_ctx) != 0)
+        {
+            LOG_WARN("[WS AUTH] Unauthorized WebSocket upgrade attempt from fd=%d", client->fd);
+            const char *response =
+                "HTTP/1.1 401 Unauthorized\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n"
+                "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"Unauthorized: Invalid or missing token\"}";
+            SSL_write(client->ssl, response, strlen(response));
+            remove_epoll_client(client->fd);
+            return;
+        }
+
+        // *** Store username from JWT (trusted, not from client message!) ***
+        strncpy(client->username, auth_ctx.username, sizeof(client->username) - 1);
+        client->username[sizeof(client->username) - 1] = '\0';
+        client->user_id = auth_ctx.user_id;
+        strncpy(client->role, auth_ctx.role, sizeof(client->role) - 1);
+        client->role[sizeof(client->role) - 1] = '\0';
+
+        LOG_INFO("[WS AUTH] WebSocket upgrade authorized for user: %s (ID: %d)",
+                 client->username, client->user_id);
+
         if (ws_handshake(client->fd, client->ssl, client->buffer) < 0)
         {
             LOG_ERROR("Websocket handshake failed\n");
@@ -458,6 +528,10 @@ static void process_http_request(epoll_client_t *client)
         client->state = CONN_STATE_WEBSOCKET;
         client->buffer_used = 0;
 
+        timeout_tracker_request_complete(&client->timeout);
+        ws_init_ping_tracking(client); // initialize the server ping mechanism
+        timeout_tracker_enable_keepalive(&client->timeout);
+
         LOG_INFO("Client fd=%d upgraded to websocket", client->fd);
         // Send welcome
         char welcome[256];
@@ -466,6 +540,22 @@ static void process_http_request(epoll_client_t *client)
                  client->client_id);
         ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT,
                       welcome, strlen(welcome));
+        return;
+    }
+    // Handle CORS preflight requests
+    if (strncmp(client->buffer, "OPTIONS ", 8) == 0)
+    {
+        const char *cors_response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        SSL_write(client->ssl, cors_response, strlen(cors_response));
+        remove_epoll_client(client->fd);
         return;
     }
 
@@ -483,6 +573,41 @@ static void process_http_request(epoll_client_t *client)
                                                   : request->enum_of_method == DELETE ? "DELETE"
                                                                                       : "PATCH",
              request->uri, client->fd);
+
+    // *** NEW: Check if endpoint requires authentication ***
+    if (auth_endpoint_requires_auth(request->uri, request->enum_of_method))
+    {
+        auth_context_t auth_ctx;
+        if (auth_validate_token(client->buffer, &auth_ctx) != 0)
+        {
+            LOG_WARN("[HTTP AUTH] Unauthorized request: %s %s from fd=%d",
+                     request->enum_of_method == GET ? "GET" : request->enum_of_method == POST ? "POST"
+                                                          : request->enum_of_method == PUT    ? "PUT"
+                                                          : request->enum_of_method == DELETE ? "DELETE"
+                                                                                              : "PATCH",
+                     request->uri, client->fd);
+
+            const char *response =
+                "HTTP/1.1 401 Unauthorized\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n"
+                "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"Unauthorized: Invalid or missing token\"}";
+            SSL_write(client->ssl, response, strlen(response));
+
+            // Clean up and close
+            clean_things(request->uri, request->header_info->body,
+                         request->header_info->content_type, request, NULL);
+            remove_epoll_client(client->fd);
+            return;
+        }
+
+        LOG_INFO("[HTTP AUTH] Authorized: %s (ID: %d) accessing %s",
+                 auth_ctx.username, auth_ctx.user_id, request->uri);
+    }
 
     // Route to handler (SAME LOGIC as threading!)
     int method_found = 0;
@@ -540,7 +665,7 @@ done:
 static int handle_websocket_frame(epoll_client_t *client)
 {
     char ws_buffer[BUFFER_SIZE];
-
+    timeout_tracker_activity(&client->timeout);
     // Read all available frames (edge-triggered requirement)
     while (1)
     {
@@ -548,14 +673,25 @@ static int handle_websocket_frame(epoll_client_t *client)
 
         if (bytes <= 0)
         {
+            ERR_clear_error();
             int err = SSL_get_error(client->ssl, bytes);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
             {
                 return 0; // Normal - no more frames
             }
 
-            LOG_INFO("WebSocket client #%d disconnected\n", client->client_id);
-            return -1;
+            if (err == SSL_ERROR_ZERO_RETURN || bytes < 0)
+            {
+                LOG_INFO("WebSocket client #%d disconnected\n", client->client_id);
+                // Broadcast leave message if user was logged in
+                if (client->username[0] != '\0')
+                {
+                    broadcast_leave_message(client->username);
+                    remove_online_user(client->fd);
+                    broadcast_user_list();
+                }
+                return -1;
+            }
         }
         ws_frame_t *frame = ws_parse_frame((uint8_t *)ws_buffer, bytes);
         if (!frame)
@@ -570,39 +706,136 @@ static int handle_websocket_frame(epoll_client_t *client)
             LOG_INFO("WebSocket client #%d: %s\n",
                      client->client_id, frame->payload);
 
-            // Broadcast
-            cJSON *msg_obj = cJSON_CreateObject();
-            cJSON_AddNumberToObject(msg_obj, "sender_id", client->client_id);
-            cJSON_AddStringToObject(msg_obj, "type", "message");
-            cJSON_AddStringToObject(msg_obj, "message", frame->payload);
-            cJSON_AddNumberToObject(msg_obj, "timestamp", time(NULL));
-
-            char *json_str = cJSON_PrintUnformatted(msg_obj);
-
-            // Broadcast to all WebSocket clients
-            epoll_client_t *curr = epoll_clients_head;
-            while (curr)
+            // parse json message
+            cJSON *json = cJSON_Parse(frame->payload);
+            if (!json)
             {
-                if (curr->fd != client->fd && curr->is_websocket)
+                LOG_ERROR("Failed to parse JSON from client #%d", client->client_id);
+                break;
+            }
+            cJSON *type = cJSON_GetObjectItem(json, "type");
+            if (!type)
+            {
+                LOG_ERROR("No type field in JSON from client #%d", client->client_id);
+                cJSON_Delete(json);
+                break;
+            }
+            // Handle different message types
+            if (strcmp(type->valuestring, "join") == 0)
+            {
+                // *** Username already set during WebSocket upgrade (from JWT) ***
+                // We NO LONGER trust client-provided username
+                const char *username = client->username;
+
+                if (!username || username[0] == '\0')
                 {
-                    ws_send_frame(curr->fd, curr->ssl, WS_OPCODE_TEXT,
-                                  json_str, strlen(json_str));
+                    LOG_ERROR("[WS] Client fd=%d attempted join without authentication", client->fd);
+                    cJSON_Delete(json);
+                    break;
                 }
-                curr = curr->next;
+
+                // add to online users
+                add_online_user(username, client->fd);
+
+                // broadcast join message
+                broadcast_join_message(username);
+
+                // send user list
+                broadcast_user_list();
+
+                // send message history
+                //    send_history_to_client(client);
+                LOG_INFO("User '%s' joined chat (fd=%d)",
+                         username, client->fd);
             }
 
-            free(json_str);
-            cJSON_Delete(msg_obj);
+            else if (strcmp(type->valuestring, "message") == 0)
+            {
+                cJSON *message_json = cJSON_GetObjectItem(json, "message");
+                cJSON *id_json = cJSON_GetObjectItem(json, "id");
+                const char *msg_id = id_json ? id_json->valuestring : NULL;
+                cJSON *mentions_json = cJSON_GetObjectItem(json, "mentions"); // Get mentions array
+                if (message_json && client->username[0] != '\0')
+                {
+                    const char *message = message_json->valuestring;
+                    const char *id = msg_id ? msg_id : "unknown_id"; // Use provided ID or fallback
+
+                    // Add to history with ID
+                    add_chat_message(client->username, message, id);
+                    if (mentions_json && cJSON_IsArray(mentions_json))
+                        send_notifications_to_mentioned_users(client->username, mentions_json, message);
+                    // Broadcast to all
+                    broadcast_chat_message(client->username, message, mentions_json, id);
+                }
+            }
+            else if (strcmp(type->valuestring, "typing") == 0)
+            {
+                // Typing indicator
+                if (client->username[0] != '\0')
+                {
+                    broadcast_typing_indicator(client->username);
+                }
+            }
+            else if (strcmp(type->valuestring, "private_message") == 0)
+            {
+                cJSON *to_json = cJSON_GetObjectItem(json, "to");
+                cJSON *message_json = cJSON_GetObjectItem(json, "message");
+                if (to_json && message_json && client->username[0] != '\0')
+                {
+                    const char *to_username = to_json->valuestring;
+                    const char *message = message_json->valuestring;
+                    ws_send_private_message(client->username, to_username, message);
+                    LOG_INFO("Private message from '%s' to '%s'",
+                             client->username, to_username);
+                }
+            }
+            else if (strcmp(type->valuestring, "private_typing") == 0)
+            {
+                cJSON *to_json = cJSON_GetObjectItem(json, "to");
+                if (to_json && client->username[0] != '\0')
+                {
+                    const char *to_username = to_json->valuestring;
+                    ws_send_private_typing(client->username, to_username);
+                }
+            }
+            /// adding the reaction feature
+            else if (strcmp(type->valuestring, "reaction") == 0)
+            {
+                cJSON *messageId = cJSON_GetObjectItem(json, "messageId");
+                cJSON *emoji = cJSON_GetObjectItem(json, "emoji");
+                cJSON *action = cJSON_GetObjectItem(json, "action");
+                cJSON *location = cJSON_GetObjectItem(json, "location");
+                if (messageId && emoji && action && client->username[0] != '\0')
+                {
+                    const char *loc = location ? location->valuestring : "group:General";
+                    // broadcast reaction with actio type
+                    broadcast_reaction(client->username, messageId->valuestring, emoji->valuestring, action->valuestring,
+                                       loc);
+                    // Log it for debugging
+                    LOG_INFO("User '%s'  %s reaction %s to message %s",
+                             client->username, strcmp(action->valuestring, "add") == 0 ? "added" : "removed", emoji->valuestring, messageId->valuestring);
+                }
+            }
+            cJSON_Delete(json);
             break;
 
         case WS_OPCODE_PING:
             ws_send_frame(client->fd, client->ssl, WS_OPCODE_PONG,
                           frame->payload, frame->payload_len);
             break;
-
+        case WS_OPCODE_PONG:
+            handle_pong_response(client);
+            return 0;
         case WS_OPCODE_CLOSE:
             LOG_INFO("WebSocket client #%d requested close\n",
                      client->client_id);
+            // Broadcast leave message if user was logged in
+            if (client->username[0] != '\0')
+            {
+                broadcast_leave_message(client->username);
+                remove_online_user(client->fd);
+                broadcast_user_list();
+            }
             ws_send_frame(client->fd, client->ssl, WS_OPCODE_CLOSE, NULL, 0);
             ws_free_frame(frame);
             return -1;
@@ -611,7 +844,6 @@ static int handle_websocket_frame(epoll_client_t *client)
             LOG_ERROR("Unknown opcode %d from client #%d\n",
                       frame->opcode, client->client_id);
         }
-
         ws_free_frame(frame);
     }
     return 0;
@@ -708,6 +940,7 @@ static void accept_new_connections(socket_t server_fd, SSL_CTX *ssl_ctx)
         }
 
         LOG_INFO("Added client fd=%d to epoll\n", client_fd);
+        break;
     }
 }
 
@@ -789,15 +1022,18 @@ static void check_timeouts(void)
                                                         g_config.request_timeout_sec,
                                                         g_config.connection_timeout_sec,
                                                         g_config.keepalive_timeout_sec);
-
-            LOG_INFO("Connection fd=%d timed out: %s", current->fd, reason);
-            remove_epoll_client(current->fd);
+            if (current->is_websocket)
+                continue;
+            else
+            {
+                LOG_INFO("Connection fd=%d timed out: %s", current->fd, reason);
+                remove_epoll_client(current->fd);
+            }
+            free((void *)reason);
         }
-
         current = next;
     }
 }
-
 /**
  * listening_to_client_epoll - Main epoll event loop
  *
@@ -846,8 +1082,12 @@ void listening_to_client_epoll(socket_t server_fd, SSL_CTX *ssl)
     // Main event loop
     struct epoll_event events[MAX_EPOLL_EVENTS];
     int timeout_counter = 0;
+    int ping_check_counter = 0;
     const int TIMEOUT_CHECK_INTERVAL = 10; // Check timeout every 10 iterations
-    while (!should_shutdown())             // Check shutdown flag from signals
+    const int PING_CHECK_INTERVAL = 5;
+
+    time_t last_cleanup = time(NULL);
+    while (!should_shutdown()) // Check shutdown flag from signals
     {
         // Wait for events - THIS IS THE ONLY BLOCKING POINT
         int n_events = epoll_wait(epoll_fd, events, MAX_EPOLL_EVENTS, EPOLL_TIMEOUT_MS);
@@ -858,7 +1098,7 @@ void listening_to_client_epoll(socket_t server_fd, SSL_CTX *ssl)
             {
                 if (should_shutdown())
                 {
-                    LOG_INFO("Shutting down server...");
+                    fprintf(stderr, "[DEBUG] EINTR received and shutdown requested. Breaking loop.\n");
                     break;
                 }
                 else
@@ -870,16 +1110,31 @@ void listening_to_client_epoll(socket_t server_fd, SSL_CTX *ssl)
         if (n_events == 0)
         {
             timeout_counter++;
+            ping_check_counter++;
             if (timeout_counter >= TIMEOUT_CHECK_INTERVAL)
             {
                 check_timeouts();
                 timeout_counter = 0;
                 // Log connection stats periodically
                 if (g_conn_tracker)
-                {
                     conn_limits_print_stats(g_conn_tracker);
-                }
             }
+
+            /** Check connection health for web sockets **/
+            if (ping_check_counter >= PING_CHECK_INTERVAL)
+            {
+                ws_check_connection_health(epoll_clients_head);
+                ping_check_counter = 0;
+            }
+
+            // Clean old typing indicators every 10 seconds
+            time_t now = time(NULL);
+            if (now - last_cleanup > 10)
+            {
+                cleanup_old_typing_indicators();
+                last_cleanup = now;
+            }
+
             // Check for config reload
             if (should_reload())
             {
@@ -924,6 +1179,8 @@ void listening_to_client_epoll(socket_t server_fd, SSL_CTX *ssl)
         epoll_client_t *next = client->next;
         client_count++;
 
+        fprintf(stderr, "[DEBUG] Closing client fd=%d\n", client->fd);
+        fflush(stderr);
         LOG_INFO("Closing client fd=%d (state=%d)", client->fd, client->state);
 
         /* Send WebSocket close frame if it's a WebSocket connection */
@@ -957,6 +1214,497 @@ void listening_to_client_epoll(socket_t server_fd, SSL_CTX *ssl)
     close(epoll_fd);
 
     LOG_INFO("Server shutdown complete");
+    return;
+}
+
+void add_online_user(const char *username, socket_t client_fd)
+{
+    online_user_t *new_user = calloc(1, sizeof(online_user_t));
+    if (!new_user)
+    {
+        LOG_ERROR("Failed to allocate online user structure..");
+        return;
+    }
+    strncpy(new_user->username, username, sizeof(new_user->username) - 1);
+    new_user->username[sizeof(new_user->username) - 1] = '\0';
+    new_user->client_fd = client_fd;
+    new_user->last_active = time(NULL);
+
+    pthread_mutex_lock(&online_users_mutex);
+    new_user->next = online_users_head;
+    online_users_head = new_user;
+    pthread_mutex_unlock(&online_users_mutex);
+
+    LOG_INFO("User '%s' added to online list (fd=%d)", username, client_fd);
+}
+
+void remove_online_user(socket_t client_fd)
+{
+    pthread_mutex_lock(&online_users_mutex);
+
+    online_user_t **current = &online_users_head;
+    while (*current)
+    {
+        if ((*current)->client_fd == client_fd)
+        {
+            online_user_t *to_free = *current;
+            *current = (*current)->next;
+            free(to_free);
+            LOG_INFO("Removed user (fd = %d) from online list", client_fd);
+            break;
+        }
+        current = &(*current)->next;
+    }
+    pthread_mutex_unlock(&online_users_mutex);
+}
+
+int get_online_user_count(void)
+{
+    int count = 0;
+    pthread_mutex_lock(&online_users_mutex);
+    online_user_t *current = online_users_head;
+    while (current)
+    {
+        count++;
+        current = current->next;
+    }
+    pthread_mutex_unlock(&online_users_mutex);
+    return count;
+}
+
+void add_chat_message(const char *username, const char *message, const char *id)
+{
+    chat_message_history_t *new_msg = malloc(sizeof(chat_message_history_t));
+    if (!new_msg)
+    {
+        LOG_ERROR("Failed to allocate chat message");
+        return;
+    }
+    strncpy(new_msg->username, username, sizeof(new_msg->username) - 1);
+    new_msg->username[sizeof(new_msg->username) - 1] = '\0';
+    strncpy(new_msg->message, message, sizeof(new_msg->message) - 1);
+    new_msg->message[sizeof(new_msg->message) - 1] = '\0';
+    if (id)
+    {
+        strncpy(new_msg->id, id, sizeof(new_msg->id) - 1);
+        new_msg->id[sizeof(new_msg->id) - 1] = '\0';
+    }
+    else
+    {
+        new_msg->id[0] = '\0';
+    }
+    new_msg->timestamp = time(NULL);
+
+    pthread_mutex_lock(&history_mutex);
+
+    // add to beginning of the list
+    new_msg->next = message_history_head;
+    message_history_head = new_msg;
+    // keep only last MAX_HISTORY_MESSAGES
+    int count = 0;
+    chat_message_history_t *current = message_history_head;
+    chat_message_history_t *prev = NULL;
+
+    while (current && count < MAX_HISTORY_MESSAGES)
+    {
+        prev = current;
+        current = current->next;
+        count++;
+    }
+    if (count)
+    {
+        prev->next = NULL;
+        while (current)
+        {
+            chat_message_history_t *to_free = current;
+            current = current->next;
+            free(to_free);
+        }
+    }
+    pthread_mutex_unlock(&history_mutex);
+}
+
+/**
+ * is_user_mentioned - Check if a username is in the mentions array
+ *  The username to check
+ *  JSON array of mentioned usernames
+ * Returns: 1 if mentioned, 0 if not
+ */
+
+int is_user_mentioned(const char *username, cJSON *mentions)
+{
+    if (!mentions || !cJSON_IsArray(mentions))
+        return 0;
+
+    // Get how many mentions are in the array
+    int mention_count = cJSON_GetArraySize(mentions);
+
+    // loop through each mention in the array
+    for (int i = 0; i < mention_count; i++)
+    {
+        // Get mention at position i
+        cJSON *item = cJSON_GetArrayItem(mentions, i);
+        // check if it's a string and matches the username we are looking for
+        if (cJSON_IsString(item) && strcmp(item->valuestring, username) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * send_mention_notification - Send a special notification to a mentioned user
+ * Who mentioned them (sender's username)
+ * The user being mentioned (recipient's username)
+ * The original message content
+ * Returns: 1 if sent successfully, 0 if user offline or error
+ * This creates a special notification that triggers a toast/sound
+ * on the frontend for mentioned users.
+ */
+
+int send_mention_notification(const char *from, const char *to, const char *message)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "mention_notification"); // Special type
+    cJSON_AddStringToObject(root, "from", from);                   // Who mentioned
+    cJSON_AddStringToObject(root, "message", message);             // The message
+    cJSON_AddNumberToObject(root, "timestamp", time(NULL));        // When
+
+    // Convert JSON to string for sending
+    char *json_str = cJSON_PrintUnformatted(root);
+    // Find the mentioned user connection
+    epoll_client_t *recipient = find_client_by_username(to);
+    int sent = 0;
+    // If user is online, send the notification
+    if (recipient)
+    {
+        if (ws_send_frame(recipient->fd, recipient->ssl, WS_OPCODE_TEXT, json_str, strlen(json_str)) == 0)
+        {
+            sent = 1;
+            LOG_INFO("Mention notification sent to %s from %s", to, from);
+        }
+        else
+        {
+            LOG_ERROR("Failed to send mention notification to %s", to);
+        }
+    }
+    cJSON_Delete(root);
+    free(json_str);
+
+    return sent;
+}
+
+/**
+ * send_notifications_to_mentioned_users - Send notifications to ALL mentioned users
+ *  Who sent the original message
+ *  JSON array of mentioned usernames (already deduplicated)
+ *  The original message content
+ *
+ * This ensures EVERY mentioned user gets a notification, but only ONE
+ *      notification per user (no duplicates).
+ */
+
+void send_notifications_to_mentioned_users(const char *sender, cJSON *mentions, const char *message)
+{
+    if (!mentions || !cJSON_IsArray(mentions))
+        return;
+
+    int mention_count = cJSON_GetArraySize(mentions);
+    LOG_INFO("Sending notifications to %d mentioned users", mention_count);
+    // Track who we've already notified (to avoid duplicates)
+    char *notified[32] = {0}; // Simple array to track notified users
+    int notified_count = 0;
+    for (int i = 0; i < mention_count; i++)
+    {
+        cJSON *item = cJSON_GetArrayItem(mentions, i);
+        if (!cJSON_IsString(item))
+            continue;
+
+        const char *mentioned_user = item->valuestring;
+
+        // Skip if user mentioned themselves
+        if (strcmp(sender, mentioned_user) == 0)
+        {
+            LOG_DEBUG("User %s mentioned themselves, skipping notification", sender);
+            continue;
+        }
+        // Check if we already notified this user (duplicate prevention)
+        int already_notified = 0;
+        for (int j = 0; j < notified_count; j++)
+        {
+            if (strcmp(notified[j], mentioned_user) == 0)
+            {
+                already_notified = 1;
+                break;
+            }
+        }
+        // If not notified yet, send notification
+        if (!already_notified)
+        {
+            if (send_mention_notification(sender, mentioned_user, message))
+            {
+                notified[notified_count++] = (char *)mentioned_user;
+                LOG_INFO("Notification sent to %s", mentioned_user);
+            }
+            else
+            {
+                LOG_WARN("Failed to send notification to %s", mentioned_user);
+            }
+        }
+    }
+}
+
+void send_history_to_client(epoll_client_t *client)
+{
+    pthread_mutex_lock(&history_mutex);
+    // first, count how many messages we have
+    int count = 0;
+    chat_message_history_t *current = message_history_head;
+    while (current && count < MAX_HISTORY_MESSAGES)
+    {
+        count++;
+        current = current->next;
+    }
+    if (count == 0)
+    {
+        pthread_mutex_unlock(&history_mutex);
+        return;
+    }
+    // create an array of message pointers
+    chat_message_history_t *messages[count];
+
+    // fill array in reverse(newest to oldest)
+    current = message_history_head;
+    for (int i = count - 1; i >= 0; i--)
+    {
+        messages[i] = current; // store oldest at index 0
+        current = current->next;
+    }
+    // Now send in chronological order (oldest at index 0 first)
+    for (int i = 0; i < count; i++)
+    {
+        cJSON *msg_json = cJSON_CreateObject();
+        cJSON_AddStringToObject(msg_json, "type", "message");
+        if (messages[i]->id[0] != '\0')
+        {
+            cJSON_AddStringToObject(msg_json, "id", messages[i]->id);
+        }
+        cJSON_AddStringToObject(msg_json, "username", messages[i]->username);
+        cJSON_AddStringToObject(msg_json, "message", messages[i]->message);
+        cJSON_AddNumberToObject(msg_json, "timestamp", messages[i]->timestamp);
+
+        char *json_str = cJSON_PrintUnformatted(msg_json);
+        ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT, json_str, strlen(json_str));
+        cJSON_Delete(msg_json);
+        free(json_str);
+    }
+    pthread_mutex_unlock(&history_mutex);
+}
+
+void broadcast_user_list(void)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "users");
+    cJSON *users_array = cJSON_CreateArray();
+
+    pthread_mutex_lock(&online_users_mutex);
+    online_user_t *current = online_users_head;
+    while (current)
+    {
+        cJSON *user_obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(user_obj, "username", current->username);
+        cJSON_AddBoolToObject(user_obj, "isOnline", 1);
+        cJSON_AddItemToArray(users_array, user_obj);
+        current = current->next;
+    }
+    pthread_mutex_unlock(&online_users_mutex);
+    cJSON_AddItemToObject(root, "users", users_array);
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    // send to all websocket clients
+    epoll_client_t *client = epoll_clients_head;
+    while (client)
+    {
+        if (client->is_websocket && client->username[0] != '\0')
+        {
+            ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT, json_str, strlen(json_str));
+        }
+        client = client->next;
+    }
+    cJSON_Delete(root);
+    free(json_str);
+}
+
+void broadcast_join_message(const char *username)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "join");
+    cJSON_AddStringToObject(root, "username", username);
+    cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    epoll_client_t *client = epoll_clients_head;
+    while (client)
+    {
+        if (client->is_websocket && strcmp(client->username, username) != 0)
+        {
+            ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT,
+                          json_str, strlen(json_str));
+        }
+        client = client->next;
+    }
+
+    cJSON_Delete(root);
+    free(json_str);
+}
+
+void broadcast_leave_message(const char *username)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "leave");
+    cJSON_AddStringToObject(root, "username", username);
+    cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    epoll_client_t *client = epoll_clients_head;
+    while (client)
+    {
+        if (client->is_websocket && client->username[0] != '\0')
+        {
+            ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT,
+                          json_str, strlen(json_str));
+        }
+        client = client->next;
+    }
+
+    cJSON_Delete(root);
+    free(json_str);
+}
+
+void broadcast_chat_message(const char *username, const char *message, cJSON *mentions, const char *msg_id)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "message");
+    if (msg_id)
+        cJSON_AddStringToObject(root, "id", msg_id);
+    cJSON_AddStringToObject(root, "username", username);
+    cJSON_AddStringToObject(root, "message", message);
+    cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+
+    if (mentions && cJSON_IsArray(mentions))
+    {
+        cJSON *mentions_copy = cJSON_Duplicate(mentions, 1);
+        cJSON_AddItemToObject(root, "mentions", mentions_copy);
+    }
+    else
+    {
+        cJSON_AddArrayToObject(root, "mentions"); // Empty array
+    }
+
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    epoll_client_t *client = epoll_clients_head;
+    while (client)
+    {
+        if (client->is_websocket && client->username[0] != '\0')
+        {
+            ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT,
+                          json_str, strlen(json_str));
+        }
+        client = client->next;
+    }
+
+    cJSON_Delete(root);
+    free(json_str);
+}
+
+void broadcast_reaction(const char *username, const char *messageId, const char *emoji, const char *action, const char *location)
+{
+    // create a json object to send to all the clients
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "reaction");
+    cJSON_AddStringToObject(root, "username", username);
+    cJSON_AddStringToObject(root, "messageId", messageId);
+    cJSON_AddStringToObject(root, "emoji", emoji);
+    cJSON_AddStringToObject(root, "action", action);
+    cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+    cJSON_AddStringToObject(root, "location", location);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    // loop through all connected clients
+    epoll_client_t *client = epoll_clients_head;
+    while (client)
+    {
+        if (client->is_websocket && client->username[0] != '\0')
+        {
+            if (strncmp(location, "group:", 6) == 0)
+            {
+                if (ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT, json_str, strlen(json_str)) == 0)
+                {
+                    LOG_INFO("reaction '%s' sent to client", emoji);
+                }
+            }
+            else if (strncmp(location, "private:", 8) == 0)
+            {
+                const char *peer = location + 8;
+                if (strcmp(client->username, username) == 0 || strcmp(client->username, peer) == 0)
+                    ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT, json_str, strlen(json_str));
+            }
+        }
+        client = client->next;
+    }
+    cJSON_Delete(root);
+    free(json_str);
+}
+
+void broadcast_typing_indicator(const char *username)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "typing");
+    cJSON_AddStringToObject(root, "username", username);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    epoll_client_t *client = epoll_clients_head;
+    while (client)
+    {
+        if (client->is_websocket && client->username[0] != '\0' &&
+            strcmp(client->username, username) != 0)
+        {
+            ws_send_frame(client->fd, client->ssl, WS_OPCODE_TEXT,
+                          json_str, strlen(json_str));
+        }
+        client = client->next;
+    }
+
+    cJSON_Delete(root);
+    free(json_str);
+}
+
+void cleanup_old_typing_indicators(void)
+{
+    time_t now = time(NULL);
+    pthread_mutex_lock(&typing_mutex);
+
+    typing_indicator_t **current = &typing_indicators_head;
+    while (*current)
+    {
+        if (now - (*current)->last_typing > 3)
+        {
+            // Remove old indicator
+            typing_indicator_t *to_free = *current;
+            *current = (*current)->next;
+            free(to_free);
+        }
+        else
+        {
+            current = &(*current)->next;
+        }
+    }
+
+    pthread_mutex_unlock(&typing_mutex);
 }
 
 void *thread_func(void *arg)
@@ -981,7 +1729,7 @@ void *thread_func(void *arg)
         if (bytesRead < 0)
             fprintf(stderr, "error in reading bytes");
         SSL_shutdown(ssl);
-SSL_free(ssl);
+        SSL_free(ssl);
         close(new_socket);
         return NULL;
     }
@@ -1036,6 +1784,23 @@ SSL_free(ssl);
             {
             case WS_OPCODE_TEXT:
                 printf("Client %d: %s\n", client_id, frame->payload);
+
+                // Check rate limit BEFORE processing message
+                int user_id = client_id; // Should be populated from auth context
+                if (!rate_limit_check(user_id))
+                {
+                    LOG_WARN("Rate limit exceeded for user_id=%d", user_id);
+                    // Send error message to client
+                    cJSON *error_obj = cJSON_CreateObject();
+                    cJSON_AddStringToObject(error_obj, "error", "Rate limit exceeded");
+                    cJSON_AddNumberToObject(error_obj, "remaining", rate_limit_remaining(user_id));
+                    char *error_json = cJSON_PrintUnformatted(error_obj);
+                    ws_send_frame(new_socket, ssl, WS_OPCODE_TEXT, error_json, -1);
+                    free(error_json);
+                    cJSON_Delete(error_obj);
+                    ws_free_frame(frame);
+                    break;
+                }
 
                 // Create JSON message
                 cJSON *msg_obj = cJSON_CreateObject();
@@ -1222,14 +1987,12 @@ struct httpRequest *parse_methods(char *response)
         clean_things(method_string, temp_response, request, NULL);
         return NULL;
     }
-    request->enum_for_uri = (strcmp(request->uri, "/") == 0) ? ROOT_URI : (strcmp(request->uri, "/users") == 0)    ? URI_USERS
-                                                                      : (strcmp(request->uri, "/me") == 0)         ? URI_USER_INFO
-                                                                      : strcmp(request->uri, "/profile") == 0      ? URI_FOR_PROFILE
-                                                                      : (strncmp(request->uri, "/users/", 7) == 0) ? ((is_just_id(request->uri + 7)) ? URI_USERS_WITH_ID : URI_UNKNOWN)
-                                                                      : (strcmp(request->uri, "/register") == 0)   ? URI_FOR_REGISTRATION
-                                                                      : strcmp(request->uri, "/login") == 0        ? URI_FOR_LOGIN
-                                                                      : strcmp(request->uri, "/chat") == 0         ? URI_FOR_CHAT
-                                                                                                                   : URI_UNKNOWN;
+    request->enum_for_uri = (strcmp(request->uri, "/") == 0) ? ROOT_URI : (strcmp(request->uri, "/me") == 0)         ? URI_USER_INFO
+                                                                       : strcmp(request->uri, "/profile") == 0      ? URI_FOR_PROFILE
+                                                                       : (strcmp(request->uri, "/register") == 0)   ? URI_FOR_REGISTRATION
+                                                                       : strcmp(request->uri, "/login") == 0        ? URI_FOR_LOGIN
+                                                                       : strcmp(request->uri, "/chat") == 0         ? URI_FOR_CHAT
+                                                                                                                    : URI_UNKNOWN;
     request->enum_of_method = strcmp(method_string, "GET") == 0 ? GET : (strcmp(method_string, "POST") == 0) ? POST
                                                                     : strcmp(method_string, "PUT") == 0      ? PUT
                                                                     : strcmp(method_string, "DELETE") == 0   ? DELETE
@@ -1261,32 +2024,21 @@ void get_func(socket_t fd, SSL *ssl, struct httpRequest *Request)
         serve_file(fd, ssl, "public/chat.html");
     else
     {
-        JSON_RESPONSE *json_body = (JSON_RESPONSE *)handle_get_uri(Request, Request->enum_for_uri);
-        if (!json_body)
-        {
-            JSON_RESPONSE *json_body = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
-            json_body->json_string = strdup("{\"message\":\"json is not having anything..endpoint entered might be wrong..\"}");
-            json_body->Status = INTERNAL_SERVER_ERROR;
+        JSON_RESPONSE *json_body = NULL;
+        if (Request->enum_for_uri == URI_USER_INFO) {
+            json_body = get_user_info();
+        } else {
+            json_body = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
+            json_body->json_string = strdup("{\"error\":\"Endpoint not found or invalid\"}");
+            json_body->Status = NOT_FOUND;
         }
         send_response_back(fd, ssl, json_body);
         close(fd);
-        clean_things(json_body->json_string, json_body, NULL);
+        if (json_body->json_string) free(json_body->json_string);
+        free(json_body);
     }
 }
-void patch_func(socket_t fd, SSL *ssl, struct httpRequest *Request)
-{
-    JSON_RESPONSE *json_response = NULL;
-    json_response = handle_patch_uri(Request->uri, Request->header_info->body);
-    if (!json_response)
-    {
-        json_response = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
-        json_response->json_string = strdup("\"Message\":\"Nothing received from the server\"");
-        json_response->Status = NOT_FOUND;
-    }
-    send_response_back(fd, ssl, json_response);
-    close(fd);
-    clean_things(json_response->json_string, json_response, NULL);
-}
+
 char *get_content_type(char *buff)
 {
     if (!buff)
@@ -1366,11 +2118,7 @@ void post_func(socket_t client_fd, SSL *ssl, struct httpRequest *post_request)
     JSON_RESPONSE *json_response = NULL;
     if (strcmp(post_request->header_info->content_type, "application/json") == 0)
     {
-        if (strcmp(post_request->uri, "/users") == 0)
-        {
-            json_response = handle_post_data_via_json(post_request->header_info->body);
-        }
-        else if (strcmp(post_request->uri, "/register") == 0)
+        if (strcmp(post_request->uri, "/register") == 0)
         {
             json_response = handle_post_json_for_register(post_request->header_info->body);
         }
@@ -1380,136 +2128,49 @@ void post_func(socket_t client_fd, SSL *ssl, struct httpRequest *post_request)
         }
         else
         {
+            json_response = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
             json_response->json_string = strdup("{\"error\" : \"This endpoint is not defined yet\"}");
             json_response->Status = BAD_REQUEST;
         }
     }
-    else if (strcmp(post_request->header_info->content_type, "application/x-www-form-urlencoded") == 0)
-    {
-        json_response = handle_post_data_via_html_form(post_request->header_info->body); // name=Rehan&age=21&email=dewanrehan%40gmail.com -> name=Rehan&age=21&email=dewanrehan06@gmail.com
-    }
     else
     {
         json_response = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
-        json_response->json_string = strdup("{\"message\":\"SOmething wrong has happened\"}");
-        json_response->Status = INTERNAL_SERVER_ERROR;
+        json_response->json_string = strdup("{\"message\":\"Unsupported content type or invalid request\"}");
+        json_response->Status = BAD_REQUEST;
     }
+
     // Format HTTP response (just like get_func does)
     send_response_back(client_fd, ssl, json_response);
-    close(client_fd);                                              // Close the connection
-    clean_things(json_response->json_string, json_response, NULL); // Free the allocated JSON string
+    close(client_fd);
+    if (json_response && json_response->json_string)                   // Close the connection
+        clean_things(json_response->json_string, json_response, NULL); // Free the allocated JSON string
 }
 void put_func(socket_t fd, SSL *ssl, struct httpRequest *Request)
 {
     JSON_RESPONSE *json = NULL;
-    if (strncmp(Request->uri, "/me", 3) == 0)
+    if (strcmp(Request->uri, "/me") == 0)
     {
-        // if (is_just_id(Request->uri + 7))
-        // {
-        //     json = handle_put_with_id(atoi(Request->uri + 7), Request->header_info->body);
-        // }
         json = handle_update_current_user((const char *)Request->header_info->body);
     }
+    
     if (!json)
     {
         json = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
         if (json)
         {
-            json->json_string = strdup("\"message\" : \"invalid uri or endpoint being passed\"");
+            json->json_string = strdup("{\"error\" : \"invalid uri or endpoint being passed\"}");
             json->Status = BAD_REQUEST;
         }
     }
     send_response_back(fd, ssl, json);
     close(fd);
-    clean_things(json->json_string, json, NULL);
-}
-
-void delete_func(socket_t fd, SSL *ssl, struct httpRequest *Request)
-{
-    JSON_RESPONSE *json_response = NULL;
-    if (strncmp(Request->uri, "/users/", 7) == 0 && is_just_id(Request->uri + 7))
-    {
-        json_response = handle_delete_with_id(atoi(Request->uri + 7));
-    }
-    if (!json_response)
-    {
-        json_response = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
-        if (json_response)
-        {
-            json_response->json_string = strdup("\"Message\" : \"This endpoint is not defined yet\"");
-            json_response->Status = BAD_REQUEST;
-        }
-        else
-        {
-            LOG_ERROR("Allocation error in delete_func()");
-            return;
-        }
-    }
-    send_response_back(fd, ssl, json_response);
-    close(fd);
-    clean_things(json_response->json_string, json_response, NULL);
-}
-
-int is_just_id(const char *data)
-{
-    const char *ptr = data;
-    while (*ptr != '\0')
-    {
-        if (*ptr < '0' || *ptr > '9')
-            return 0;
-        ptr++;
-    }
-    return 1;
-}
-JSON_RESPONSE *handle_get_uri(struct httpRequest *Request, uri_t uri_enum)
-{
-    JSON_RESPONSE *json = NULL;
-    switch (uri_enum)
-    {
-    case ROOT_URI:
-        json = handle_get_info();
-        break;
-    case URI_USERS:
-        json = handle_get_users();
-        break;
-    case URI_USERS_WITH_ID:
-        json = handle_user_with_id(atoi(Request->uri + 7));
-        break;
-    case URI_USER_INFO:
-        json = get_user_info();
-        break;
-    default:
-        json = NULL;
-    }
-    return json;
-}
-
-JSON_RESPONSE *handle_patch_uri(const char *uri, const char *body)
-{
-    JSON_RESPONSE *json = NULL;
-    if (strncmp(uri, "/users/", 7) == 0)
-    {
-        if (is_just_id(uri + 7))
-        {
-            json = handle_patch_with_id(atoi(uri + 7), body);
-        }
-    }
-    if (!json)
-    {
-        json = (JSON_RESPONSE *)malloc(sizeof(JSON_RESPONSE));
-        json->json_string = strdup("\"message\" : \"format is not /users/{id}\"");
-        json->Status = BAD_REQUEST;
-    }
-    return json;
+    if (json && json->json_string) 
+        clean_things(json->json_string, json, NULL);
 }
 
 int make_hashed_password(char *original_pass, char *hashed_pass, const char *salt)
 {
-    if (*salt == 0)
-    {
-        if (!RAND_bytes((unsigned char *)salt, SALT_LEN))
-            return -1;
-    }
     if (PKCS5_PBKDF2_HMAC((const char *)original_pass,
                           strlen(original_pass),
                           (const unsigned char *)salt,
@@ -1557,6 +2218,7 @@ jwt_t *get_decoded_token(char *token)
 }
 void serve_file(socket_t fd, SSL *ssl, const char *path)
 {
+    (void)fd;
     int file_fd = open(path, O_RDONLY);
     if (file_fd < 0)
         return;
@@ -1577,7 +2239,7 @@ void serve_file(socket_t fd, SSL *ssl, const char *path)
     ssize_t bytes_read;
     while ((bytes_read = read(file_fd, file_buffer, sizeof(file_buffer))) > 0)
     {
-        SSL_write(ssl, file_buffer, bytes_read); // ← CHANGED from sendfile()
+        SSL_write(ssl, file_buffer, bytes_read);
     }
 
     close(file_fd);
@@ -1633,7 +2295,7 @@ void remove_client_for_websock(socket_t fd)
             break;
         }
         prev = curr;
-        curr->next = prev->next;
+        curr = curr->next;
     }
     pthread_mutex_unlock(&client_mutex);
 }
@@ -1667,13 +2329,13 @@ SSL_CTX *create_ssl_context()
 void configure_ssl_context(SSL_CTX *ctx)
 {
     // Load certificate and private key
-    if (SSL_CTX_use_certificate_file(ctx, "src/certs/cert.pem", SSL_FILETYPE_PEM) <= 0)
+    if (SSL_CTX_use_certificate_file(ctx, g_config.ssl_cert_path, SSL_FILETYPE_PEM) <= 0)
     {
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
 
-    if (SSL_CTX_use_PrivateKey_file(ctx, "src/certs/key.pem", SSL_FILETYPE_PEM) <= 0)
+    if (SSL_CTX_use_PrivateKey_file(ctx, g_config.ssl_key_path, SSL_FILETYPE_PEM) <= 0)
     {
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);

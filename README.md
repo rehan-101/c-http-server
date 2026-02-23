@@ -1,89 +1,114 @@
-# HTTP Server in C
+# Professional C HTTP/WebSocket Server
 
-A lightweight HTTP server written in C, implementing RESTful APIs with SQLite for persistent storage and JSON request/response handling. Currently, the project includes **user authentication via login and registration endpoints**.
-
----
-
-## Features Implemented So Far
-
-- RESTful API endpoints for testing purposes:
-  - **GET** `/students` → Retrieve all students
-  - **GET** `/students/{id}` → Retrieve a student by ID
-  - **POST** `/students` → Add a new student
-  - **PUT** `/students/{id}` → Update a student completely
-  - **PATCH** `/students/{id}` → Update student partially
-  - **DELETE** `/students/{id}` → Remove a student
-- These endpoints were created for testing and demonstrating REST API functionality; the **main implementation focuses on user authentication**.
-
-- **User Authentication Endpoints (Main Feature)**
-  - **POST** `/register` → Register new users
-  - **POST** `/login` → User login and JWT token generation
-  - JWT-based authentication for secure session management:
-    - Token includes standard claims (subject, issued time, expiration)
-    - Token signed using a server-side secret
-    - Expired tokens are rejected
-  - Frontend pages included:
-    - `login.html`
-    - `registration.html`
-    Both pages include embedded CSS and JS for form handling.
-  - Forms are submitted via POST requests to ensure secure transmission of credentials.
-  - Prevented insecure GET requests from browser form submission.
-
-- JSON-based communication between client and server
-- SQLite3 integration for persistent storage
-- Basic error handling (e.g., 404 for unknown resources, 400 for invalid requests)
+A high-performance, edge-triggered I/O multiplexing HTTPS and WebSocket server built from scratch in C using `epoll`. This project implements modern web standards including TLS/SSL, JWT authentication, and real-time communication.
 
 ---
 
-## Project Structure
+## 🚀 Key Features
 
-- `src/` → C source files (`.c`)  
-- `include/` → Header files (`.h`)  
-- `public/` → HTML pages (`login.html`, `registration.html`)  
-- `Makefile` → Build and run instructions  
-- `README.md` → Project documentation  
+- **High-Performance Architecture**: Core event loop powered by `epoll` (Edge-Triggered) for efficient handling of thousands of concurrent connections without the overhead of multi-threading.
+- **Secure Communication**: Full TLS/SSL support via OpenSSL, providing encrypted HTTPS and WebSocket (WSS) layers.
+- **Real-Time WebSockets**: Integrated WebSocket server (RFC 6455) for low-latency, bidirectional communication.
+- **State-of-the-Art Auth**: Secure JWT (JSON Web Token) authentication for stateless, scalable session management.
+- **Persistent Storage**: Integrated with SQLite3 for reliable data management.
+- **Safety & Robustness**:
+  - Graceful shutdown/cleanup on SIGINT (Ctrl+C).
+  - Rate limiting to prevent abuse.
+  - Connection limits (global and per-IP).
+  - Timeout tracking for slow/stale clients.
+- **Structured Logging**: Thread-safe, multi-level logging system.
 
 ---
 
-## Dependencies
+## 🛠 Tech Stack
 
-Make sure the following libraries are installed:
+- **Language**: C
+- **I/O Engine**: Linux `epoll`
+- **Networking**: BSD Sockets, OpenSSL
+- **Database**: SQLite3
+- **Authentication**: JWT (JSON Web Tokens)
+- **Serialization**: cJSON
 
-- gcc
-- cJSON (`libcjson-dev`)
-- SQLite3 (`libsqlite3-dev`)
-- libjwt (`libjwt-dev`)
-- OpenSSL (`libssl-dev`)
+---
 
-## Environment Variables
+## 📋 Prerequisites
 
-The server requires the following environment variable:
-
-- `SECRET_KEY` – Secret key used to sign and verify JWT tokens
-
-### Generate a Secret Key (One Time)
-
-Use the following command to generate a secure random secret key:
+Ensure you have the following libraries installed on your Linux system:
 
 ```bash
-openssl rand -base64 32
+# Ubuntu/Debian example
+sudo apt-get update
+sudo apt-get install -y build-essential libssl-dev libsqlite3-dev libcjson-dev libjwt-dev
 ```
-## Build Instructions
 
+---
+
+## ⚙️ Configuration & Setup
+
+### 1. SSL Certificates
+The server requires SSL certificates for HTTPS/WSS. Generate self-signed certificates for local development:
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:4096 -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes
+```
+
+### 2. Environment Variables
+For security, the JWT secret key must be stored explicitly in your environment. **Never hardcode this key.**
+
+```bash
+# Generate a secure key
+export SECRET_KEY=$(openssl rand -base64 32)
+```
+
+> [!IMPORTANT]
+> You must `export SECRET_KEY` in every new terminal session before running the server, or add it to your `.bashrc` / `.env`.
+
+### 3. Server Configuration
+Edit `server.conf` to adjust port, timeouts, and limits:
+- `port`: Default 8443
+- `max_connections`: Global limit
+- `db_path`: Path to SQLite database
+
+---
+
+## 🏗 Build & Run
+
+### Compile the Server
 ```bash
 make
 ```
-## Run Instructions
 
+### Run the Server
 ```bash
 make run
 ```
+
+### Clean Build Files
+```bash
+make clean
+```
+
 ---
-## Notes
 
-- Use `make clean` to remove object files and the compiled binary.
-- Backend supports user login and registration with JWT authentication.
-- Frontend HTML files (login.html and registration.html) contain all necessary CSS and JS; no separate app.js is required.
-- The STUDENTS endpoints were created for testing REST API structure and are not part of the main implementation.
-- JWT tokens ensure secure and stateless authentication for users.
+## 📂 Project Structure
 
+- `src/` - Core implementation (`server.c`, `auth.c`, `websocket.c`, etc.)
+- `include/` - Header files and API definitions
+- `public/` - Static assets and frontend templates
+- `certs/` - (Required) Your SSL certificates
+- `server.conf` - Main configuration file
+- `users.db` - SQLite database (auto-created on first run)
+
+---
+
+## 📜 API Highlights
+
+- **Auth**: `POST /register`, `POST /login`
+- **User management**: `GET /me`, `PUT /me` (Requires JWT)
+- **Chat**: Connect via WebSocket at `/ws` (Requires JWT protocol negotiation)
+
+---
+
+## ⚖️ License
+Copyright (c) 2026. All rights reserved.

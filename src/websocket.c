@@ -95,22 +95,72 @@ int ws_handshake(socket_t client_fd, SSL *ssl, const char *request)
     if (!accept_key)
         return -1;
 
-    // Send handshake response
-    char response[512];
-    int len = snprintf(response, sizeof(response),
-                       "HTTP/1.1 101 Switching Protocols\r\n"
-                       "Upgrade: websocket\r\n"
-                       "Connection: Upgrade\r\n"
-                       "Sec-WebSocket-Accept: %s\r\n"
-                       "\r\n",
-                       accept_key);
-
-    free(accept_key);
-
-    if (SSL_write(ssl, response, len) < 0)
+    // *** NEW: Check if client sent Sec-WebSocket-Protocol header ***
+    char response[1024];  // Increased size to fit full token
+    const char *protocol_header = strstr(request, "Sec-WebSocket-Protocol:");
+    if (protocol_header && strstr(protocol_header, "Bearer"))
     {
-        perror("Failed to send handshake response");
-        return -1;
+        // *** FIX: Extract the FULL protocol value to echo back ***
+        // Client sends: "Sec-WebSocket-Protocol: Bearer.<JWT_TOKEN>"
+        // We must respond with EXACT same value (RFC 6455)
+        
+        const char *proto_start = protocol_header + strlen("Sec-WebSocket-Protocol:");
+        // Skip whitespace
+        while (*proto_start == ' ' || *proto_start == '\t') proto_start++;
+        
+        // Find end of line
+        const char *proto_end = strstr(proto_start, "\r\n");
+        if (!proto_end) {
+            proto_end = proto_start + strlen(proto_start);
+        }
+        
+        int proto_len = proto_end - proto_start;
+        char protocol_value[1024];
+        if (proto_len >= (int)sizeof(protocol_value)) {
+            proto_len = sizeof(protocol_value) - 1;
+        }
+        strncpy(protocol_value, proto_start, proto_len);
+        protocol_value[proto_len] = '\0';
+        
+        // Trim trailing whitespace
+        while (proto_len > 0 && (protocol_value[proto_len-1] == ' ' || protocol_value[proto_len-1] == '\t')) {
+            protocol_value[--proto_len] = '\0';
+        }
+        
+        // Client requested Bearer protocol - must echo EXACT value back
+        int len = snprintf(response, sizeof(response),
+                           "HTTP/1.1 101 Switching Protocols\r\n"
+                           "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Sec-WebSocket-Accept: %s\r\n"
+                           "Sec-WebSocket-Protocol: %s\r\n"
+                           "\r\n",
+                           accept_key, protocol_value);
+        free(accept_key);
+        if (SSL_write(ssl, response, len) < 0)
+        {
+            perror("Failed to send handshake response");
+            return -1;
+        }
+        
+        LOG_DEBUG("[WS] Handshake with protocol: %s", protocol_value);
+    }
+    else
+    {
+        // No protocol requested - standard handshake
+        int len = snprintf(response, sizeof(response),
+                           "HTTP/1.1 101 Switching Protocols\r\n"
+                           "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Sec-WebSocket-Accept: %s\r\n"
+                           "\r\n",
+                           accept_key);
+        free(accept_key);
+        if (SSL_write(ssl, response, len) < 0)
+        {
+            perror("Failed to send handshake response");
+            return -1;
+        }
     }
 
     printf("WebSocket handshake successful for fd %d\n", client_fd);
@@ -121,12 +171,14 @@ ws_frame_t *ws_parse_frame(const uint8_t *data, size_t len)
 {
     if (len < 2)
         return NULL;
-    ws_frame_t *frame = malloc(sizeof(ws_frame_t));
+    ws_frame_t *frame = calloc(1, sizeof(ws_frame_t));
     if (!frame)
         return NULL;
-    memset(frame, 0, sizeof(ws_frame_t));
-
     frame->fin = (data[0] >> 7) & 0x1;
+    frame->rsv1 = (data[0] & 0x40) ? 1 : 0;
+    frame->rsv2 = (data[0] & 0x20) ? 1 : 0;
+    frame->rsv3 = (data[0] & 0x10) ? 1 : 0;
+
     frame->opcode = data[0] & 0x0F;
 
     frame->mask = (data[1] >> 7) & 0x01;
@@ -195,6 +247,7 @@ ws_frame_t *ws_parse_frame(const uint8_t *data, size_t len)
 }
 int ws_send_frame(socket_t fd, SSL *ssl, ws_opcode_t opcode, const char *payload, size_t len)
 {
+    (void)fd;
     uint8_t header[10];
     size_t header_len = 0;
 
@@ -382,4 +435,143 @@ cleanup:
     close(client_fd);
     printf("Client %d handler thread exiting\n", client_id);
     return NULL;
+}
+void handle_pong_response(epoll_client_t *client)
+{
+    if (!client)
+        return;
+    time_t now = time(NULL);
+    LOG_INFO("received pong from client : %s\n", client->username);
+    int rtt_ms = (now - client->ping_pong->last_ping_sent) * 1000;
+    // Reset tracking on successful pong
+    client->ping_pong->ping_in_flight = 0;
+    client->ping_pong->missed_pongs = 0;
+    client->ping_pong->last_pong_received = now;
+
+    // Log connection quality
+    if (rtt_ms < 50)
+        LOG_DEBUG("PONG from %s - Excellent RTT: %dms",
+                  client->username, rtt_ms);
+    else if (rtt_ms < 200)
+        LOG_DEBUG("PONG from %s - Good RTT: %dms",
+                  client->username, rtt_ms);
+    else if (rtt_ms < 500)
+        LOG_WARN("PONG from %s - High latency: %dms",
+                 client->username, rtt_ms);
+    else
+        LOG_WARN("PONG from %s - Very high latency: %dms",
+                 client->username, rtt_ms);
+    // Update activity for timeout tracker
+    timeout_tracker_activity(&client->timeout);
+}
+
+int ws_send_ping(epoll_client_t *client)
+{
+    if (!client || !client->is_websocket || !client->ssl)
+        return -1;
+    // Don't send if already waiting for a pong
+    if (client->ping_pong->ping_in_flight)
+    {
+        return 0;
+    }
+    LOG_DEBUG("Sending PING to %s (fd=%d)",
+              client->username, client->fd);
+    time_t now = time(NULL);
+    int ret = ws_send_frame(client->fd, client->ssl, WS_OPCODE_PING, NULL, 0);
+    if (ret == 0)
+    {
+        client->ping_pong->last_ping_sent = now;
+        client->ping_pong->missed_pongs++;
+        client->ping_pong->ping_in_flight = 1;
+
+        LOG_DEBUG("PING sent to %s (missed: %d/%d)", client->username, client->ping_pong->missed_pongs, MAX_MISSED_PINGS);
+    }
+    return ret;
+}
+
+void ws_check_connection_health(epoll_client_t *clients_list_head)
+{
+    time_t now = time(NULL);
+    epoll_client_t *client = clients_list_head;
+    while (client)
+    {
+        epoll_client_t *next = client->next;
+        if (client->is_websocket && client->state == CONN_STATE_WEBSOCKET)
+        {
+            // -------------------------------------------------
+            // DECISION 1: Should we send a ping?
+            // -------------------------------------------------
+            if (!client->ping_pong->ping_in_flight && (now - client->ping_pong->last_ping_sent) >= PING_INTERVAL)
+            {
+                if (!ws_send_ping(client))
+                {
+                    LOG_INFO("Ping request sent to fd = %d , username = %s", client->fd, *(client->username) ? client->username : "Anonymous");
+                }
+            }
+            // -------------------------------------------------
+            // DECISION 2: Ping timeout - no pong received?
+            // -------------------------------------------------
+            else if (client->ping_pong->ping_in_flight && (now - client->ping_pong->last_ping_sent) >= PONG_TIMEOUT)
+            {
+                LOG_WARN("PONG timeout for %s - missed %d/%d",
+                         client->username,
+                         client->ping_pong->missed_pongs,
+                         MAX_MISSED_PINGS);
+                client->ping_pong->ping_in_flight = false;
+                // -------------------------------------------------
+                // DECISION 3: Too many missed pongs?
+                // -------------------------------------------------
+                if (client->ping_pong->missed_pongs >= MAX_MISSED_PINGS)
+                {
+                    LOG_INFO("Client %s DISCONNECTED - missed %d pongs",
+                             client->username,
+                             client->ping_pong->missed_pongs);
+                    // Clean up chat resources
+                    remove_epoll_client(client->fd);
+                }
+            }
+            // -------------------------------------------------
+            // DECISION 4: Is connection healthy?
+            // -------------------------------------------------
+            if ((now - client->ping_pong->last_pong_received) < PING_INTERVAL * 2)
+            {
+                // Got pong in last 60 seconds - healthy
+                client->timeout.keepalive_enabled = 1;
+            }
+        }
+        client = next;
+    }
+}
+
+void ws_send_private_message(const char *from, const char *to, const char *message)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "private_message");
+    cJSON_AddStringToObject(root, "from", from);
+    cJSON_AddStringToObject(root, "message", message);
+    cJSON_AddNumberToObject(root, "timestamp", time(NULL));
+
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    epoll_client_t *recipient = find_client_by_username(to);
+    if (recipient)
+        ws_send_frame(recipient->fd, recipient->ssl, WS_OPCODE_TEXT, json_str, strlen(json_str));
+    cJSON_Delete(root);
+    free(json_str);
+}
+void ws_send_private_typing(const char *from, const char *to)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "private_typing");
+    cJSON_AddStringToObject(root, "from", from);
+    char *json_str = cJSON_PrintUnformatted(root);
+    epoll_client_t *recipient = find_client_by_username(to);
+    if (recipient)
+    {
+        ws_send_frame(recipient->fd, recipient->ssl, WS_OPCODE_TEXT,
+                      json_str, strlen(json_str));
+    }
+
+    cJSON_Delete(root);
+    free(json_str);
 }

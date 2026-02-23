@@ -164,7 +164,7 @@ static inline const char *timeout_tracker_reason(const TimeoutTracker *tracker,
     {
         if (now - tracker->ssl_handshake_start > ssl_handshake_timeout)
         {
-            return "SSL handshake timeout";
+            return strdup("SSL handshake timeout");
         }
     }
 
@@ -172,7 +172,7 @@ static inline const char *timeout_tracker_reason(const TimeoutTracker *tracker,
     {
         if (now - tracker->request_start > request_timeout)
         {
-            return "Request read timeout";
+            return strdup("Request read timeout");
         }
     }
 
@@ -180,18 +180,18 @@ static inline const char *timeout_tracker_reason(const TimeoutTracker *tracker,
     {
         if (now - tracker->last_activity > keepalive_timeout)
         {
-            return "Keep-alive timeout";
+            return strdup("Keep-alive timeout");
         }
     }
     else
     {
         if (now - tracker->last_activity > idle_timeout)
         {
-            return "Idle timeout";
+            return strdup("Idle timeout");
         }
     }
 
-    return "Unknown timeout";
+    return strdup("Unknown timeout");
 }
 
 #endif

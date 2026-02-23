@@ -1,10 +1,11 @@
 #include "../include/database.h"
+#include "../include/config.h"
 #include <string.h>
 sqlite3 *db = NULL;
 sqlite3 *start_db()
 {
     char *err_msg = NULL;
-    int result = sqlite3_open_v2("/home/rehan_syed/http_server/users.db", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+    int result = sqlite3_open_v2(g_config.db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
     if (result != SQLITE_OK)
     {
         fprintf(stderr, "Cannot open the sqlite file..(%s)", sqlite3_errmsg(db));
@@ -12,19 +13,6 @@ sqlite3 *start_db()
         return NULL;
     }
     fprintf(stdout, "sQlite initiated successfully...");
-    const char *query = "CREATE TABLE IF NOT EXISTS STUDENTS("
-                        "id INTEGER PRIMARY KEY,"
-                        "name TEXT NOT NULL,"
-                        "email TEXT NOT NULL UNIQUE);";
-
-    result = sqlite3_exec(db, query, 0, 0, &err_msg);
-    if (result != SQLITE_OK)
-    {
-        fprintf(stderr, "Table(Students) creation error : %s\n", err_msg);
-        sqlite3_free(err_msg);
-    }
-    else
-        fprintf(stdout, "Table(Students) created successfully\n");
     result = 0;
     const char *register_user = "CREATE TABLE IF NOT EXISTS User("
                                 "id INTEGER PRIMARY KEY,"
@@ -44,14 +32,11 @@ sqlite3 *start_db()
     return db;
 }
 const char *const SQL_Queries[] = {
-    "SELECT id,name,email FROM STUDENTS;",
     "SELECT id,name,username,email FROM User WHERE id = ?;",
     "SELECT id,password,salt FROM User WHERE username=?;",
-    "INSERT INTO STUDENTS(name,email) VALUES (? , ?);",
-    "INSERT INTO STUDENTS(name,email) VALUES (? , ?);",
     "INSERT INTO User(name,username,email,password,salt) VALUES (?,?,?,?,?);",
-    "UPDATE STUDENTS SET name = ? , email = ? WHERE id = ?;",
-    "DELETE FROM STUDENTS WHERE id = ? RETURNING id,name,email;"};
+    "UPDATE User SET name = ? , email = ? WHERE id = ?;", // Assuming User update
+    "DELETE FROM User WHERE id = ?;"};
 
 #define MAX_QUERIES (sizeof(SQL_Queries) / sizeof(SQL_Queries[0]))
 sqlite3_stmt *get_query(sqlite3 *db, Db_Query query)

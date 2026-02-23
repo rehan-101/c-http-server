@@ -127,6 +127,7 @@ const char *logger_level_string(LogLevel level)
 void logger_log(LogLevel level, const char *file, int line,
                 const char *func, const char *format, ...)
 {
+    (void)func;
 
     /* Skip if below minimum level */
     if (level < g_logger.min_level)
@@ -168,7 +169,7 @@ void logger_log(LogLevel level, const char *file, int line,
 
     /* Build log line */
     char log_line[1280];
-    int len = snprintf(log_line, sizeof(log_line),
+    snprintf(log_line, sizeof(log_line),
                        "[%s] [%s] [%s:%d] %s\n",
                        timestamp,
                        logger_level_string(level),

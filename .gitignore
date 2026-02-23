@@ -8,15 +8,22 @@ myServer
 
 # Database
 *.db
+users.db
 
 # OS
 .DS_Store
+Thumbs.db
 
-#certs
-src/certs/key.pem
-src/certs/cert.pem
+# Certs (sensitive - keep ignored)
+certs/
+src/certs/
+*.pem
+*.key
+*.crt
 
-#log file
+# Log files
+*.log
 server.log
-#config file
+
+# Config (contains sensitive data like ports, secrets)
 server.conf
